@@ -54,20 +54,35 @@ find_library(COREGRAPHICS_FRAMEWORK CoreGraphics REQUIRED)
 
 # --- Compile Metal shaders ---
 
+# Allow override for iOS / iOS-Simulator builds; defaults to macOS host build.
+if(NOT DEFINED MSPLAT_METAL_SDK)
+    if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        string(TOLOWER "${CMAKE_OSX_SYSROOT}" _msplat_sysroot_lower)
+        if(_msplat_sysroot_lower MATCHES "iphonesimulator")
+            set(MSPLAT_METAL_SDK "iphonesimulator")
+        else()
+            set(MSPLAT_METAL_SDK "iphoneos")
+        endif()
+    else()
+        set(MSPLAT_METAL_SDK "macosx")
+    endif()
+endif()
+message(STATUS "msplat: compiling Metal shaders for SDK ${MSPLAT_METAL_SDK}")
+
 set(METAL_SOURCE ${CMAKE_SOURCE_DIR}/core/metal/msplat_metal.metal)
 configure_file(${METAL_SOURCE} ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.metal COPYONLY)
 add_custom_command(
     OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib
-    COMMAND xcrun -sdk macosx metal -O3 -c
+    COMMAND xcrun -sdk ${MSPLAT_METAL_SDK} metal -O3 -c
         ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.metal
         -o ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.air
-    COMMAND xcrun -sdk macosx metallib
+    COMMAND xcrun -sdk ${MSPLAT_METAL_SDK} metallib
         ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.air
         -o ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib
     COMMAND rm -f ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.air
     COMMAND rm -f ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.metal
     DEPENDS ${METAL_SOURCE}
-    COMMENT "Compiling Metal kernels → default.metallib"
+    COMMENT "Compiling Metal kernels → default.metallib (sdk=${MSPLAT_METAL_SDK})"
 )
 add_custom_target(metallib ALL
     DEPENDS ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib)
@@ -105,15 +120,17 @@ target_compile_definitions(msplat_core PRIVATE USE_MPS)
 add_dependencies(msplat_core metallib)
 
 # --- CLI binary ---
-
-add_executable(msplat cli/msplat.cpp)
-target_link_libraries(msplat PRIVATE
-    msplat_core
-    CLI11::CLI11
-    pthread
-)
-target_compile_definitions(msplat PRIVATE USE_MPS)
-install(TARGETS msplat DESTINATION bin)
+# The CLI target requires a pthread main entry point and is not used on iOS.
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    add_executable(msplat cli/msplat.cpp)
+    target_link_libraries(msplat PRIVATE
+        msplat_core
+        CLI11::CLI11
+        pthread
+    )
+    target_compile_definitions(msplat PRIVATE USE_MPS)
+    install(TARGETS msplat DESTINATION bin)
+endif()
 
 # --- Python bindings (optional, enabled when building via scikit-build-core) ---
 

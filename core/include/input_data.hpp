@@ -40,6 +40,10 @@ struct Camera {
 struct Points {
     std::vector<float> xyz;     // N*3 flattened
     std::vector<uint8_t> rgb;   // N*3 flattened
+    /// Optional surface normals (N*3 flattened). When present (size > 0)
+    /// the trainer initialises gaussians anisotropically with the local Z
+    /// axis aligned to the normal — see PocketGS (arXiv:2601.17354) §3.2.
+    std::vector<float> normals;
     int64_t count = 0;
 };
 
