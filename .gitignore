@@ -1,5 +1,8 @@
 # Build artifacts
 build/
+build-iphoneos/
+build-iphonesimulator/
+staging/
 *.o
 *.a
 *.so
