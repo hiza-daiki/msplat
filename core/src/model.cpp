@@ -60,101 +60,22 @@ Model::Model(const InputData &inputData, int numCameras,
     means = gpu_empty({numPoints, 3}, DType::Float32);
     memcpy(means.data_ptr(), inputData.points.xyz.data(), numPoints * 3 * sizeof(float));
 
-    // KNN base scale (used for both isotropic and anisotropic paths).
-    std::vector<float> baseScale;
+    // Scales: log(KNN distance to nearest neighbours)
     {
         PointsTensor pt(inputData.points.xyz.data(), numPoints);
-        // PocketGS (arXiv:2601.17354) §3.2 prescribes K=3 nearest-neighbour
-        // distances for the initial gaussian scale, vs msplat's default K=4.
-        // Smaller K tightens the per-point scale toward actual local surface
-        // density — exactly the regime our LiDAR-mesh-based prior lives in.
-        baseScale = pt.scales(3);
-    }
-
-    const bool useAnisotropic = !inputData.points.normals.empty()
-                              && (int64_t)inputData.points.normals.size() == numPoints * 3;
-    // PocketGS (arXiv:2601.17354) §3.2 reports normal-direction = 0.3 × tangential
-    // gives the cleanest anisotropic seeding for surface gaussians.
-    const float kNormalScaleRatio = 0.3f;
-
-    scales = gpu_empty({numPoints, 3}, DType::Float32);
-    quats  = gpu_empty({numPoints, 4}, DType::Float32);
-    float *sp = scales.data<float>();
-    float *qp = quats.data<float>();
-
-    if (useAnisotropic) {
-        const float *nrm = inputData.points.normals.data();
-        for (int64_t i = 0; i < numPoints; i++) {
-            float s = baseScale[i];
-            // Local frame: tangent (sx,sy) × normal (sz). Smaller scale along normal.
-            sp[i*3 + 0] = std::log(s);
-            sp[i*3 + 1] = std::log(s);
-            sp[i*3 + 2] = std::log(std::max(1e-6f, s * kNormalScaleRatio));
-
-            // Build orthonormal basis (t1, t2, n) where n = surface normal.
-            float nx = nrm[i*3 + 0], ny = nrm[i*3 + 1], nz = nrm[i*3 + 2];
-            float nlen = std::sqrt(nx*nx + ny*ny + nz*nz);
-            if (nlen < 1e-6f) {
-                // Bad normal → fall back to identity quat
-                qp[i*4 + 0] = 1; qp[i*4 + 1] = 0; qp[i*4 + 2] = 0; qp[i*4 + 3] = 0;
-                continue;
-            }
-            nx /= nlen; ny /= nlen; nz /= nlen;
-            // Pick seed not parallel to n
-            float sx = std::abs(nx) < 0.9f ? 1.0f : 0.0f;
-            float sy = std::abs(nx) < 0.9f ? 0.0f : 1.0f;
-            float sz = 0.0f;
-            // t1 = normalize(seed - dot(seed, n) * n)
-            float dot = sx*nx + sy*ny + sz*nz;
-            float t1x = sx - dot*nx, t1y = sy - dot*ny, t1z = sz - dot*nz;
-            float t1len = std::sqrt(t1x*t1x + t1y*t1y + t1z*t1z);
-            t1x /= t1len; t1y /= t1len; t1z /= t1len;
-            // t2 = n × t1
-            float t2x = ny*t1z - nz*t1y;
-            float t2y = nz*t1x - nx*t1z;
-            float t2z = nx*t1y - ny*t1x;
-            // Rotation matrix R = [t1 | t2 | n] (columns).
-            // Convert to quaternion (Shepperd's method).
-            float trace = t1x + t2y + nz;
-            float qw, qx, qy, qz;
-            if (trace > 0.0f) {
-                float s2 = std::sqrt(trace + 1.0f) * 2.0f;
-                qw = 0.25f * s2;
-                qx = (t2z - ny) / s2;
-                qy = (nx - t1z) / s2;
-                qz = (t1y - t2x) / s2;
-            } else if (t1x > t2y && t1x > nz) {
-                float s2 = std::sqrt(1.0f + t1x - t2y - nz) * 2.0f;
-                qw = (t2z - ny) / s2;
-                qx = 0.25f * s2;
-                qy = (t1y + t2x) / s2;
-                qz = (t1z + nx) / s2;
-            } else if (t2y > nz) {
-                float s2 = std::sqrt(1.0f + t2y - t1x - nz) * 2.0f;
-                qw = (nx - t1z) / s2;
-                qx = (t1y + t2x) / s2;
-                qy = 0.25f * s2;
-                qz = (ny + t2z) / s2;
-            } else {
-                float s2 = std::sqrt(1.0f + nz - t1x - t2y) * 2.0f;
-                qw = (t1y - t2x) / s2;
-                qx = (t1z + nx) / s2;
-                qy = (ny + t2z) / s2;
-                qz = 0.25f * s2;
-            }
-            qp[i*4 + 0] = qw;
-            qp[i*4 + 1] = qx;
-            qp[i*4 + 2] = qy;
-            qp[i*4 + 3] = qz;
-        }
-        std::fprintf(stderr, "msplat: anisotropic init from %lld point normals\n",
-                     (long long)numPoints);
-    } else {
+        auto baseScale = pt.scales();
+        scales = gpu_empty({numPoints, 3}, DType::Float32);
+        float *sp = scales.data<float>();
         for (int64_t i = 0; i < numPoints; i++) {
             float v = std::log(baseScale[i]);
             sp[i*3] = sp[i*3+1] = sp[i*3+2] = v;
         }
-        // Random quaternions
+    }
+
+    // Random quaternions
+    quats = gpu_empty({numPoints, 4}, DType::Float32);
+    {
+        float *qp = quats.data<float>();
         std::mt19937 rng(42);
         std::uniform_real_distribution<float> dist(0.0f, 1.0f);
         for (int64_t i = 0; i < numPoints; i++) {
