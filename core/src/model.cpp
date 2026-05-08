@@ -221,7 +221,10 @@ void Model::setupOptimizers(){
     }
     adam_step_count = 0;
     means_lr_init = 0.00016f;
-    means_lr_final = 0.0000016f;
+    // 上流デフォルト 1.6e-6 (= init / 100) は 30K iter 用に過剰減衰。3K iter の
+    // ような短い予算では step ~2000 以降に means が固まり、ARKit pose 起因の
+    // smear を後半で補正できない。10x 持ち上げて後半も位置調整が効くように。
+    means_lr_final = 0.000016f;
 
     densify_split_flag = gpu_zeros({buf_capacity}, DType::Int32);
     densify_dup_flag = gpu_zeros({buf_capacity}, DType::Int32);
