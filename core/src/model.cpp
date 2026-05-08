@@ -64,7 +64,11 @@ Model::Model(const InputData &inputData, int numCameras,
     std::vector<float> baseScale;
     {
         PointsTensor pt(inputData.points.xyz.data(), numPoints);
-        baseScale = pt.scales();  // mean distance to nearest neighbours
+        // PocketGS (arXiv:2601.17354) §3.2 prescribes K=3 nearest-neighbour
+        // distances for the initial gaussian scale, vs msplat's default K=4.
+        // Smaller K tightens the per-point scale toward actual local surface
+        // density — exactly the regime our LiDAR-mesh-based prior lives in.
+        baseScale = pt.scales(3);
     }
 
     const bool useAnisotropic = !inputData.points.normals.empty()
