@@ -351,6 +351,11 @@ void msplat_drain_stage_times(std::vector<double> stage_times[], int max_stages,
 // Memory cost per pixel = K * 20 = 2560 bytes.
 static constexpr uint32_t POCKETGS_K_MAX = 128;
 
+// Step 2b: dispatch toggle. 0 = legacy per-tile-replay backward (default,
+// safe baseline). 1 = cache-driven backward (pgs_rasterize_backward_kernel).
+// Flip to 1 once the parity test in Step 2c passes.
+#define POCKETGS_USE_CACHE_BACKWARD 1
+
 // Cached buffer pool — all intermediate GPU buffers are reused across iterations.
 // Sizes only change at densification (every 100 steps); between densifications
 // this eliminates all per-iteration GPU allocations.
@@ -1124,6 +1129,32 @@ std::tuple<MTensor, float> msplat_train_step(
     auto encode_rast_bwd = [&](id<MTLComputeCommandEncoder> enc) {
         if (bwd_K_max <= 1) {
             // Monolithic
+#if POCKETGS_USE_CACHE_BACKWARD
+            // PocketGS Step 2b: cache-driven backward. One thread per pixel,
+            // consumes the replay cache written by nd_rasterize_forward_kernel.
+            auto img_sz_2 = std::make_shared<std::array<uint32_t, 2>>(
+                std::array<uint32_t, 2>{img_width, img_height});
+            [enc setComputePipelineState:ctx->pgs_rasterize_backward_kernel_cpso];
+            [enc setBytes:img_sz_2->data() length:sizeof(*img_sz_2) atIndex:0];
+            ENC_BUF(enc, xys,           1);
+            ENC_BUF(enc, conics,        2);
+            ENC_BUF(enc, colors,        3);
+            ENC_BUF(enc, opacities,     4);  // canonical logits
+            ENC_BUF(enc, final_Ts,      5);
+            ENC_BUF(enc, background,    6);
+            ENC_BUF(enc, v_rendered,    7);
+            ENC_BUF(enc, g_tcache.pgs_cache_ids,   8);
+            ENC_BUF(enc, g_tcache.pgs_cache_Cin,   9);
+            ENC_BUF(enc, g_tcache.pgs_cache_alpha, 10);
+            ENC_BUF(enc, g_tcache.pgs_cache_count, 11);
+            ENC_BUF(enc, v_xy,          12);
+            ENC_BUF(enc, v_conic,       13);
+            ENC_BUF(enc, v_colors_rast, 14);
+            ENC_BUF(enc, v_opacity,     15);
+            // Grid: one thread per pixel, no tile cooperation needed.
+            [enc dispatchThreads:MTLSizeMake(img_width, img_height, 1)
+                threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+#else
             MTLSize num_tg = MTLSizeMake((img_width+RAST_BLOCK_X-1)/RAST_BLOCK_X, (img_height+RAST_BLOCK_Y-1)/RAST_BLOCK_Y, 1);
             [enc setComputePipelineState:ctx->rasterize_backward_kernel_cpso];
             [enc setBytes:rast_tb->data() length:sizeof(*rast_tb) atIndex:0];
@@ -1136,6 +1167,7 @@ std::tuple<MTensor, float> msplat_train_step(
             ENC_BUF(enc, v_xy, 11); ENC_BUF(enc, v_conic, 12);
             ENC_BUF(enc, v_colors_rast, 13); ENC_BUF(enc, v_opacity, 14);
             [enc dispatchThreadgroups:num_tg threadsPerThreadgroup:MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1)];
+#endif
         } else {
             // Chunked backward
             uint32_t tile_x = (img_width + RAST_BLOCK_X - 1) / RAST_BLOCK_X;
