@@ -347,9 +347,9 @@ void msplat_drain_stage_times(std::vector<double> stage_times[], int max_stages,
 #define RAST_BLOCK_Y 8
 
 // PocketGS replay cache size — must match POCKETGS_K_MAX in msplat_metal.metal.
-// Bumped 64 → 128 after Step 1 verification showed 5–15% overflow at 64.
-// Memory cost per pixel = K * 20 = 2560 bytes.
-static constexpr uint32_t POCKETGS_K_MAX = 128;
+// Cut 128 → 32 while the cache is diagnostic-only (T-operator disabled). Bump
+// back when Step 2c parity test passes.
+static constexpr uint32_t POCKETGS_K_MAX = 32;
 
 // Step 2b: dispatch toggle. 0 = legacy per-tile-replay backward.
 // 1 = cache-driven backward (pgs_rasterize_backward_kernel).
