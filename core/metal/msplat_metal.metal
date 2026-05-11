@@ -11,6 +11,14 @@ using namespace metal;
 #define CHANNELS 3
 #define MAX_REGISTER_CHANNELS 3
 
+// PocketGS (arXiv:2601.17354) §III-C1 replay cache. Per-pixel ring of up to
+// POCKETGS_K_MAX contributors. Each slot stores the canonical gaussian id,
+// the *incoming* pixel color (before this gaussian blended), and the alpha
+// used. Backward consumes this directly instead of replaying the tile sweep.
+// Step 1 of the rollout writes the cache but doesn't yet consume it — forward
+// output (out_img/final_Ts/final_idx) is bit-identical to the baseline path.
+#define POCKETGS_K_MAX 64
+
 constant float SH_C0 = 0.28209479177387814f;
 constant float SH_C1 = 0.4886025119029199f;
 constant float SH_C2[] = {
@@ -482,6 +490,14 @@ kernel void nd_rasterize_forward_kernel(
     device float* out_img,
     constant float* background,
     constant uint2& blockDim,
+    // PocketGS replay cache (Step 1 — write-only).
+    // Layouts are flat row-major; index by pix_id * K_MAX + k.
+    constant int* gaussian_ids_sorted,         // sorted_idx → canonical id
+    device int* pgs_cache_ids,                 // [H*W*K] int
+    device float* pgs_cache_Cin,               // [H*W*K*3] float (RGB before blend)
+    device float* pgs_cache_alpha,             // [H*W*K] float
+    device atomic_int* pgs_cache_count,        // [H*W] (per-pixel valid entry count)
+    device atomic_int* pgs_overflow_count,     // [1] (# pixels that hit K_MAX)
     uint2 blockIdx [[threadgroup_position_in_grid]],
     uint2 threadIdx [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]]
@@ -511,6 +527,8 @@ kernel void nd_rasterize_forward_kernel(
     float3 pix_out = {0.f, 0.f, 0.f};
     int last_contributor = range.x - 1;
     bool done = false;
+    int pgs_k = 0; // PocketGS: number of contributors written for this pixel so far
+    bool pgs_overflowed = false;
 
     for (int b = 0; b < num_batches; ++b) {
         // sync before loading next batch
@@ -564,6 +582,24 @@ kernel void nd_rasterize_forward_kernel(
                 break;
             }
 
+            // PocketGS cache write: record {canonical_id, C_in, alpha} BEFORE
+            // we mutate pix_out. C_in is the incoming color seen by this
+            // contributor; backward will replay forward from it without
+            // touching the rest of the tile's gaussians.
+            if (pgs_k < POCKETGS_K_MAX) {
+                const int sorted_idx = batch_start + t;
+                const int canonical_id = gaussian_ids_sorted[sorted_idx];
+                const int slot = pix_id * POCKETGS_K_MAX + pgs_k;
+                pgs_cache_ids[slot]            = canonical_id;
+                pgs_cache_Cin[slot * 3 + 0]    = pix_out.x;
+                pgs_cache_Cin[slot * 3 + 1]    = pix_out.y;
+                pgs_cache_Cin[slot * 3 + 2]    = pix_out.z;
+                pgs_cache_alpha[slot]          = alpha;
+                pgs_k += 1;
+            } else if (!pgs_overflowed) {
+                pgs_overflowed = true;
+            }
+
             const float vis = alpha * T;
             const float3 rgb = rgbs_batch[t];
             pix_out = fma(rgb, vis, pix_out);
@@ -575,6 +611,11 @@ kernel void nd_rasterize_forward_kernel(
     if (inside) {
         final_Ts[pix_id] = T;
         final_index[pix_id] = last_contributor;
+        // PocketGS: publish per-pixel valid count + bump overflow stat.
+        atomic_store_explicit(&pgs_cache_count[pix_id], pgs_k, memory_order_relaxed);
+        if (pgs_overflowed) {
+            atomic_fetch_add_explicit(pgs_overflow_count, 1, memory_order_relaxed);
+        }
         // Fused clamp_max(output, 1.0) — saturate clamps to [0,1]
         float3 bg = {background[0], background[1], background[2]};
         float3 final_rgb = saturate(fma(bg, T, pix_out));

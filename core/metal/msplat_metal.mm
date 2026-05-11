@@ -342,6 +342,12 @@ void msplat_drain_stage_times(std::vector<double> stage_times[], int max_stages,
 #define RAST_BLOCK_X 8
 #define RAST_BLOCK_Y 8
 
+// PocketGS replay cache size — must match POCKETGS_K_MAX in msplat_metal.metal.
+// Step 1 is write-only validation: enable allocation + kernel write, no
+// consumer yet. Memory cost per pixel = K * (4 + 12 + 4) = 80 bytes.
+// At 1280×720 with K=64 that's ~70 MB just for the cache.
+static constexpr uint32_t POCKETGS_K_MAX = 64;
+
 // Cached buffer pool — all intermediate GPU buffers are reused across iterations.
 // Sizes only change at densification (every 100 steps); between densifications
 // this eliminates all per-iteration GPU allocations.
@@ -380,6 +386,14 @@ struct FusedTensorCache {
     MTensor v_xy, v_conic, v_colors_rast, v_opacity, v_depth;
     MTensor v_mean3d, v_scale, v_quat, v_features_dc, v_features_rest;
 
+    // PocketGS replay cache (Step 1 — written by forward, consumed in later
+    // step). Sized with img_height/img_width × K_MAX.
+    MTensor pgs_cache_ids;        // [H, W, K]      int32
+    MTensor pgs_cache_Cin;        // [H, W, K, 3]   float32
+    MTensor pgs_cache_alpha;      // [H, W, K]      float32
+    MTensor pgs_cache_count;      // [H, W]         int32 (atomic during forward)
+    MTensor pgs_overflow_count;   // [1]            int32 (atomic counter)
+
     void ensure_forward(int np, int64_t cap, int ih, int iw, int nt,
                         id<MTLDevice> dev) {
         if (np != fwd_num_points) {
@@ -408,6 +422,15 @@ struct FusedTensorCache {
             loss_intermediates = mtensor_empty(dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
             ssim_h_buf = mtensor_empty(dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
             v_rendered = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+            // PocketGS cache — sized with image dims so it follows the same
+            // re-allocation pattern as final_Ts / out_img.
+            pgs_cache_ids   = mtensor_empty(dev, {ih, iw, (int64_t)POCKETGS_K_MAX}, DType::Int32);
+            pgs_cache_Cin   = mtensor_empty(dev, {ih, iw, (int64_t)POCKETGS_K_MAX, 3}, DType::Float32);
+            pgs_cache_alpha = mtensor_empty(dev, {ih, iw, (int64_t)POCKETGS_K_MAX}, DType::Float32);
+            pgs_cache_count = mtensor_empty(dev, {ih, iw}, DType::Int32);
+        }
+        if (!pgs_overflow_count.defined()) {
+            pgs_overflow_count = mtensor_empty(dev, {1}, DType::Int32);
         }
         if (nt != num_tiles) {
             num_tiles = nt;
@@ -491,6 +514,32 @@ static void forward_pipeline(
                     "Some gaussians were dropped from overfull tiles.\n");
             overflow_warned = true;
         }
+    }
+
+    // PocketGS Step 1 diagnostic: log per-pixel contributor stats every 100
+    // iterations. Confirms the replay cache is being populated and tells us
+    // empirically how often POCKETGS_K_MAX is hit. Reads back are gated by
+    // syncCB so they only stall the pipeline at the diagnostic cadence.
+    if (g_tcache.pgs_cache_count.defined() && g_tcache.fwd_num_points > 0
+        && (iter_count_oc % 100) == 1) {
+        ctx->syncCB();
+        const int32_t* counts = g_tcache.pgs_cache_count.data<int32_t>();
+        const int total = g_tcache.img_height * g_tcache.img_width;
+        int32_t max_count = 0;
+        int64_t sum_counts = 0;
+        for (int i = 0; i < total; ++i) {
+            const int32_t c = counts[i];
+            if (c > max_count) max_count = c;
+            sum_counts += c;
+        }
+        const int32_t overflow_px = g_tcache.pgs_overflow_count.defined()
+            ? *g_tcache.pgs_overflow_count.data<int32_t>()
+            : 0;
+        const double avg = total > 0 ? double(sum_counts) / double(total) : 0.0;
+        fprintf(stderr,
+                "[PocketGS cache] iter=%d avg_k=%.1f max_k=%d overflow_px=%d (K_MAX=%u)\n",
+                iter_count_oc, avg, (int)max_count, (int)overflow_px,
+                (unsigned)POCKETGS_K_MAX);
     }
     int64_t capacity = (int64_t)num_points * g_tcache.capacity_multiplier;
     uint32_t channels = 3;
@@ -628,6 +677,14 @@ static void forward_pipeline(
         ENC_BUF(enc, final_Ts, 7); ENC_BUF(enc, final_idx, 8); ENC_BUF(enc, out_img, 9);
         ENC_BUF(enc, background, 10);
         [enc setBytes:block_size_dim2->data() length:sizeof(*block_size_dim2) atIndex:11];
+        // PocketGS replay cache args. Pass after the existing arg block to
+        // preserve indices used elsewhere in the codebase.
+        ENC_BUF(enc, gaussian_ids,            12); // sorted_idx → canonical id
+        ENC_BUF(enc, g_tcache.pgs_cache_ids,  13);
+        ENC_BUF(enc, g_tcache.pgs_cache_Cin,  14);
+        ENC_BUF(enc, g_tcache.pgs_cache_alpha,15);
+        ENC_BUF(enc, g_tcache.pgs_cache_count,16);
+        ENC_BUF(enc, g_tcache.pgs_overflow_count, 17);
         [enc dispatchThreadgroups:num_tg threadsPerThreadgroup:tg_size];
     };
 
@@ -729,6 +786,13 @@ static void forward_pipeline(
             [blit fillBuffer:loss_sum.buffer() range:NSMakeRange(0, loss_sum.nbytes()) value:0];
             [blit fillBuffer:g_tcache.overflow_flag.buffer() range:NSMakeRange(0, g_tcache.overflow_flag.nbytes()) value:0];
             [blit fillBuffer:g_tcache.tile_scatter_counters.buffer() range:NSMakeRange(0, g_tcache.tile_scatter_counters.nbytes()) value:0];
+            // PocketGS: zero per-iteration atomics. pgs_cache_count is written
+            // once per pixel via atomic_store at the end of forward, so it
+            // technically doesn't need clearing — we do it anyway to make
+            // any post-hoc inspection unambiguous when forward didn't touch
+            // a pixel (e.g. outside-image lanes).
+            [blit fillBuffer:g_tcache.pgs_cache_count.buffer() range:NSMakeRange(0, g_tcache.pgs_cache_count.nbytes()) value:0];
+            [blit fillBuffer:g_tcache.pgs_overflow_count.buffer() range:NSMakeRange(0, g_tcache.pgs_overflow_count.nbytes()) value:0];
             [blit endEncoding];
 
             id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
@@ -808,6 +872,32 @@ std::tuple<MTensor, float> msplat_train_step(
                     "Some gaussians were dropped from overfull tiles.\n");
             overflow_warned = true;
         }
+    }
+
+    // PocketGS Step 1 diagnostic: log per-pixel contributor stats every 100
+    // iterations. Confirms the replay cache is being populated and tells us
+    // empirically how often POCKETGS_K_MAX is hit. Reads back are gated by
+    // syncCB so they only stall the pipeline at the diagnostic cadence.
+    if (g_tcache.pgs_cache_count.defined() && g_tcache.fwd_num_points > 0
+        && (iter_count_oc % 100) == 1) {
+        ctx->syncCB();
+        const int32_t* counts = g_tcache.pgs_cache_count.data<int32_t>();
+        const int total = g_tcache.img_height * g_tcache.img_width;
+        int32_t max_count = 0;
+        int64_t sum_counts = 0;
+        for (int i = 0; i < total; ++i) {
+            const int32_t c = counts[i];
+            if (c > max_count) max_count = c;
+            sum_counts += c;
+        }
+        const int32_t overflow_px = g_tcache.pgs_overflow_count.defined()
+            ? *g_tcache.pgs_overflow_count.data<int32_t>()
+            : 0;
+        const double avg = total > 0 ? double(sum_counts) / double(total) : 0.0;
+        fprintf(stderr,
+                "[PocketGS cache] iter=%d avg_k=%.1f max_k=%d overflow_px=%d (K_MAX=%u)\n",
+                iter_count_oc, avg, (int)max_count, (int)overflow_px,
+                (unsigned)POCKETGS_K_MAX);
     }
     int64_t capacity = (int64_t)num_points * g_tcache.capacity_multiplier;
     uint32_t channels = 3;
@@ -970,6 +1060,13 @@ std::tuple<MTensor, float> msplat_train_step(
             ENC_BUF(enc, final_Ts, 7); ENC_BUF(enc, final_idx, 8); ENC_BUF(enc, out_img, 9);
             ENC_BUF(enc, background, 10);
             [enc setBytes:block_size_dim2->data() length:sizeof(*block_size_dim2) atIndex:11];
+            // PocketGS replay cache args (Step 1 — write-only).
+            ENC_BUF(enc, gaussian_ids,              12);
+            ENC_BUF(enc, g_tcache.pgs_cache_ids,    13);
+            ENC_BUF(enc, g_tcache.pgs_cache_Cin,    14);
+            ENC_BUF(enc, g_tcache.pgs_cache_alpha,  15);
+            ENC_BUF(enc, g_tcache.pgs_cache_count,  16);
+            ENC_BUF(enc, g_tcache.pgs_overflow_count, 17);
             [enc dispatchThreadgroups:num_tg threadsPerThreadgroup:MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1)];
         } else {
             // Chunked
@@ -1165,6 +1262,9 @@ std::tuple<MTensor, float> msplat_train_step(
         [blit fillBuffer:loss_sum.buffer() range:NSMakeRange(0, loss_sum.nbytes()) value:0];
         [blit fillBuffer:g_tcache.overflow_flag.buffer() range:NSMakeRange(0, g_tcache.overflow_flag.nbytes()) value:0];
         [blit fillBuffer:g_tcache.tile_scatter_counters.buffer() range:NSMakeRange(0, g_tcache.tile_scatter_counters.nbytes()) value:0];
+        // PocketGS per-iteration atomic resets (see comment in the other do-blit-zero block).
+        [blit fillBuffer:g_tcache.pgs_cache_count.buffer() range:NSMakeRange(0, g_tcache.pgs_cache_count.nbytes()) value:0];
+        [blit fillBuffer:g_tcache.pgs_overflow_count.buffer() range:NSMakeRange(0, g_tcache.pgs_overflow_count.nbytes()) value:0];
         [blit fillBuffer:v_xy.buffer() range:NSMakeRange(0, v_xy.nbytes()) value:0];
         [blit fillBuffer:v_conic.buffer() range:NSMakeRange(0, v_conic.nbytes()) value:0];
         [blit fillBuffer:v_colors_rast.buffer() range:NSMakeRange(0, v_colors_rast.nbytes()) value:0];
