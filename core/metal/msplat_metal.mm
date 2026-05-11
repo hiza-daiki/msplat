@@ -347,9 +347,10 @@ void msplat_drain_stage_times(std::vector<double> stage_times[], int max_stages,
 #define RAST_BLOCK_Y 8
 
 // PocketGS replay cache size — must match POCKETGS_K_MAX in msplat_metal.metal.
-// Cut 128 → 32 while the cache is diagnostic-only (T-operator disabled). Bump
-// back when Step 2c parity test passes.
-static constexpr uint32_t POCKETGS_K_MAX = 32;
+// Back to 128 for the Step 2c parity test (cache must hold every contributor
+// so the cache-driven backward computes correct gradients to diff against
+// legacy).
+static constexpr uint32_t POCKETGS_K_MAX = 128;
 
 // Step 2b: dispatch toggle. 0 = legacy per-tile-replay backward.
 // 1 = cache-driven backward (pgs_rasterize_backward_kernel).
@@ -359,6 +360,13 @@ static constexpr uint32_t POCKETGS_K_MAX = 32;
 // The kernel math matches legacy line-for-line on paper; root cause TBD.
 // Re-enable after the parity test in Step 2c finds the discrepancy.
 #define POCKETGS_USE_CACHE_BACKWARD 0
+
+// Step 2c parity test toggle. When 1, the cache-driven backward kernel is
+// dispatched *in addition* to the legacy one, writing into shadow gradient
+// buffers. Every 100 iters we read both buffer sets back and report the
+// max |v_legacy - v_shadow| per parameter group. Training itself is
+// unaffected (Adam still consumes the legacy v_* outputs).
+#define POCKETGS_PARITY_TEST 1
 
 // Cached buffer pool — all intermediate GPU buffers are reused across iterations.
 // Sizes only change at densification (every 100 steps); between densifications
@@ -405,6 +413,14 @@ struct FusedTensorCache {
     MTensor pgs_cache_alpha;      // [H, W, K]      float32
     MTensor pgs_cache_count;      // [H, W]         int32 (atomic during forward)
     MTensor pgs_overflow_count;   // [1]            int32 (atomic counter)
+
+    // Step 2c parity test: shadow gradient buffers — the cache-driven
+    // backward writes its result here so we can diff against the legacy
+    // backward's v_* without disturbing training.
+    MTensor pgs_shadow_v_xy;            // [N, 2]
+    MTensor pgs_shadow_v_conic;         // [N, 3]
+    MTensor pgs_shadow_v_colors_rast;   // [N, 3]
+    MTensor pgs_shadow_v_opacity;       // [N, 1]
 
     void ensure_forward(int np, int64_t cap, int ih, int iw, int nt,
                         id<MTLDevice> dev) {
@@ -483,6 +499,14 @@ struct FusedTensorCache {
             v_quat = mtensor_empty(dev, {np, 4}, DType::Float32);
             v_features_dc = mtensor_empty(dev, {np, 3}, DType::Float32);
             v_features_rest = mtensor_empty(dev, {(int64_t)np, (int64_t)frb, 3}, DType::Float32);
+            // Step 2c parity-test shadow gradient buffers — same shape as the
+            // legacy outputs. Cache-driven backward writes here while legacy
+            // writes the canonical buffers; we compare on the host every 100
+            // iters to localise the gradient discrepancy.
+            pgs_shadow_v_xy = mtensor_empty(dev, {np, 2}, DType::Float32);
+            pgs_shadow_v_conic = mtensor_empty(dev, {np, 3}, DType::Float32);
+            pgs_shadow_v_colors_rast = mtensor_empty(dev, {np, 3}, DType::Float32);
+            pgs_shadow_v_opacity = mtensor_empty(dev, {np, 1}, DType::Float32);
         }
     }
 };
@@ -554,6 +578,47 @@ static void forward_pipeline(
                 iter_count_oc, avg, (int)max_count, (int)overflow_px,
                 (unsigned)POCKETGS_K_MAX,
                 g_tcache.img_width, g_tcache.img_height);
+#if POCKETGS_PARITY_TEST
+        if (g_tcache.pgs_shadow_v_xy.defined() && g_tcache.bwd_num_points > 0) {
+            const int N = g_tcache.bwd_num_points;
+            auto diff = [N](const float* a, const float* b, int dim) {
+                double max_abs = 0.0, max_rel = 0.0;
+                int first_diff_id = -1;
+                int first_diff_comp = -1;
+                for (int i = 0; i < N * dim; ++i) {
+                    const float va = a[i], vb = b[i];
+                    const float ad = std::fabs(va - vb);
+                    if (ad > max_abs) max_abs = ad;
+                    const float scale = std::max({std::fabs(va), std::fabs(vb), 1e-8f});
+                    const float rd = ad / scale;
+                    if (rd > max_rel) max_rel = rd;
+                    if (first_diff_id < 0 && ad > 1e-5f) {
+                        first_diff_id = i / dim;
+                        first_diff_comp = i % dim;
+                    }
+                }
+                return std::make_tuple(max_abs, max_rel, first_diff_id, first_diff_comp);
+            };
+            auto [xy_abs, xy_rel, xy_id, xy_c] = diff(g_tcache.v_xy.data<float>(),
+                                                      g_tcache.pgs_shadow_v_xy.data<float>(),         2);
+            auto [cn_abs, cn_rel, cn_id, cn_c] = diff(g_tcache.v_conic.data<float>(),
+                                                      g_tcache.pgs_shadow_v_conic.data<float>(),      3);
+            auto [rg_abs, rg_rel, rg_id, rg_c] = diff(g_tcache.v_colors_rast.data<float>(),
+                                                      g_tcache.pgs_shadow_v_colors_rast.data<float>(),3);
+            auto [op_abs, op_rel, op_id, op_c] = diff(g_tcache.v_opacity.data<float>(),
+                                                      g_tcache.pgs_shadow_v_opacity.data<float>(),    1);
+            (void)op_c;
+            fprintf(stderr,
+                    "[PocketGS parity] iter=%d N=%d "
+                    "xy:%.3e/%.3e[%d,%d] cn:%.3e/%.3e[%d,%d] "
+                    "rg:%.3e/%.3e[%d,%d] op:%.3e/%.3e[%d]\n",
+                    iter_count_oc, N,
+                    xy_abs, xy_rel, xy_id, xy_c,
+                    cn_abs, cn_rel, cn_id, cn_c,
+                    rg_abs, rg_rel, rg_id, rg_c,
+                    op_abs, op_rel, op_id);
+        }
+#endif
     }
     int64_t capacity = (int64_t)num_points * g_tcache.capacity_multiplier;
     uint32_t channels = 3;
@@ -910,6 +975,47 @@ std::tuple<MTensor, float> msplat_train_step(
                 iter_count_oc, avg, (int)max_count, (int)overflow_px,
                 (unsigned)POCKETGS_K_MAX,
                 g_tcache.img_width, g_tcache.img_height);
+#if POCKETGS_PARITY_TEST
+        if (g_tcache.pgs_shadow_v_xy.defined() && g_tcache.bwd_num_points > 0) {
+            const int N = g_tcache.bwd_num_points;
+            auto diff = [N](const float* a, const float* b, int dim) {
+                double max_abs = 0.0, max_rel = 0.0;
+                int first_diff_id = -1;
+                int first_diff_comp = -1;
+                for (int i = 0; i < N * dim; ++i) {
+                    const float va = a[i], vb = b[i];
+                    const float ad = std::fabs(va - vb);
+                    if (ad > max_abs) max_abs = ad;
+                    const float scale = std::max({std::fabs(va), std::fabs(vb), 1e-8f});
+                    const float rd = ad / scale;
+                    if (rd > max_rel) max_rel = rd;
+                    if (first_diff_id < 0 && ad > 1e-5f) {
+                        first_diff_id = i / dim;
+                        first_diff_comp = i % dim;
+                    }
+                }
+                return std::make_tuple(max_abs, max_rel, first_diff_id, first_diff_comp);
+            };
+            auto [xy_abs, xy_rel, xy_id, xy_c] = diff(g_tcache.v_xy.data<float>(),
+                                                      g_tcache.pgs_shadow_v_xy.data<float>(),         2);
+            auto [cn_abs, cn_rel, cn_id, cn_c] = diff(g_tcache.v_conic.data<float>(),
+                                                      g_tcache.pgs_shadow_v_conic.data<float>(),      3);
+            auto [rg_abs, rg_rel, rg_id, rg_c] = diff(g_tcache.v_colors_rast.data<float>(),
+                                                      g_tcache.pgs_shadow_v_colors_rast.data<float>(),3);
+            auto [op_abs, op_rel, op_id, op_c] = diff(g_tcache.v_opacity.data<float>(),
+                                                      g_tcache.pgs_shadow_v_opacity.data<float>(),    1);
+            (void)op_c;
+            fprintf(stderr,
+                    "[PocketGS parity] iter=%d N=%d "
+                    "xy:%.3e/%.3e[%d,%d] cn:%.3e/%.3e[%d,%d] "
+                    "rg:%.3e/%.3e[%d,%d] op:%.3e/%.3e[%d]\n",
+                    iter_count_oc, N,
+                    xy_abs, xy_rel, xy_id, xy_c,
+                    cn_abs, cn_rel, cn_id, cn_c,
+                    rg_abs, rg_rel, rg_id, rg_c,
+                    op_abs, op_rel, op_id);
+        }
+#endif
     }
     int64_t capacity = (int64_t)num_points * g_tcache.capacity_multiplier;
     uint32_t channels = 3;
@@ -1130,6 +1236,35 @@ std::tuple<MTensor, float> msplat_train_step(
         [enc dispatchThreads:grid threadsPerThreadgroup:tg];
     };
 
+#if POCKETGS_PARITY_TEST
+    // Shadow backward — same kernel as the cache-driven path, but writing
+    // into pgs_shadow_v_* so the legacy v_* (which drives Adam) is left
+    // untouched. Only the diagnostic block reads the shadow buffers.
+    auto encode_rast_bwd_shadow = [&](id<MTLComputeCommandEncoder> enc) {
+        auto img_sz_2 = std::make_shared<std::array<uint32_t, 2>>(
+            std::array<uint32_t, 2>{img_width, img_height});
+        [enc setComputePipelineState:ctx->pgs_rasterize_backward_kernel_cpso];
+        [enc setBytes:img_sz_2->data() length:sizeof(*img_sz_2) atIndex:0];
+        ENC_BUF(enc, xys,                           1);
+        ENC_BUF(enc, conics,                        2);
+        ENC_BUF(enc, colors,                        3);
+        ENC_BUF(enc, opacities,                     4);  // canonical logits
+        ENC_BUF(enc, final_Ts,                      5);
+        ENC_BUF(enc, background,                    6);
+        ENC_BUF(enc, v_rendered,                    7);
+        ENC_BUF(enc, g_tcache.pgs_cache_ids,        8);
+        ENC_BUF(enc, g_tcache.pgs_cache_Cin,        9);
+        ENC_BUF(enc, g_tcache.pgs_cache_alpha,      10);
+        ENC_BUF(enc, g_tcache.pgs_cache_count,      11);
+        ENC_BUF(enc, g_tcache.pgs_shadow_v_xy,          12);
+        ENC_BUF(enc, g_tcache.pgs_shadow_v_conic,       13);
+        ENC_BUF(enc, g_tcache.pgs_shadow_v_colors_rast, 14);
+        ENC_BUF(enc, g_tcache.pgs_shadow_v_opacity,     15);
+        [enc dispatchThreads:MTLSizeMake(img_width, img_height, 1)
+            threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+    };
+#endif
+
     auto encode_rast_bwd = [&](id<MTLComputeCommandEncoder> enc) {
         if (bwd_K_max <= 1) {
             // Monolithic
@@ -1299,6 +1434,13 @@ std::tuple<MTensor, float> msplat_train_step(
         [blit fillBuffer:v_xy.buffer() range:NSMakeRange(0, v_xy.nbytes()) value:0];
         [blit fillBuffer:v_conic.buffer() range:NSMakeRange(0, v_conic.nbytes()) value:0];
         [blit fillBuffer:v_colors_rast.buffer() range:NSMakeRange(0, v_colors_rast.nbytes()) value:0];
+#if POCKETGS_PARITY_TEST
+        // Shadow gradient buffers used by the cache-driven backward.
+        [blit fillBuffer:g_tcache.pgs_shadow_v_xy.buffer() range:NSMakeRange(0, g_tcache.pgs_shadow_v_xy.nbytes()) value:0];
+        [blit fillBuffer:g_tcache.pgs_shadow_v_conic.buffer() range:NSMakeRange(0, g_tcache.pgs_shadow_v_conic.nbytes()) value:0];
+        [blit fillBuffer:g_tcache.pgs_shadow_v_colors_rast.buffer() range:NSMakeRange(0, g_tcache.pgs_shadow_v_colors_rast.nbytes()) value:0];
+        [blit fillBuffer:g_tcache.pgs_shadow_v_opacity.buffer() range:NSMakeRange(0, g_tcache.pgs_shadow_v_opacity.nbytes()) value:0];
+#endif
         [blit fillBuffer:v_opacity.buffer() range:NSMakeRange(0, v_opacity.nbytes()) value:0];
         [blit fillBuffer:v_depth.buffer() range:NSMakeRange(0, v_depth.nbytes()) value:0];
         [blit fillBuffer:v_mean3d.buffer() range:NSMakeRange(0, v_mean3d.nbytes()) value:0];
@@ -1376,6 +1518,10 @@ std::tuple<MTensor, float> msplat_train_step(
             // Stage 5: rast_bwd
             enc = make_profiled_encoder(4);
             encode_rast_bwd(enc);
+#if POCKETGS_PARITY_TEST
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            encode_rast_bwd_shadow(enc);
+#endif
             [enc endEncoding];
 
             // Stage 6: proj_sh_bwd + Adam
@@ -1449,6 +1595,10 @@ std::tuple<MTensor, float> msplat_train_step(
             encode_loss_fwd_bwd(enc);
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             encode_rast_bwd(enc);
+#if POCKETGS_PARITY_TEST
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            encode_rast_bwd_shadow(enc);
+#endif
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             encode_proj_sh_bwd_adam(enc);
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];

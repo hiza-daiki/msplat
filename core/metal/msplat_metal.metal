@@ -16,15 +16,16 @@ using namespace metal;
 // the *incoming* pixel color (before this gaussian blended), and the alpha
 // used. Backward consumes this directly instead of replaying the tile sweep.
 //
-// K_MAX was 128 (sized for the empirical long tail at iPhone Pro 6 GB), but
-// since POCKETGS_USE_CACHE_BACKWARD = 0 the cache is only diagnostic-read
-// while we debug Step 2. We dropped it to 32 to free ~150 MB at 320×240
-// (and 1.6 GB at 640×480). Overflow rate climbs to ~30% — fine for stats,
-// would need to bump back up before re-enabling cache-driven backward.
+// K_MAX 128 — sized so cache overflow stays near 0 at our typical training
+// resolutions (160×120 / 320×240), which is required while Step 2c parity
+// test runs the cache-driven backward into shadow buffers. If only the
+// diagnostic stat is needed, K=32 would be enough; bumping back lets the
+// new backward consume every contributor and stay numerically faithful to
+// legacy.
 //
-// Memory per pixel = K * (4+12+4) = 20*32 = 640 B.
-//   160×120 → 12 MB · 320×240 → 49 MB · 480×360 → 110 MB
-#define POCKETGS_K_MAX 32
+// Memory per pixel = K * (4+12+4) = 20*128 = 2560 B.
+//   160×120 → 49 MB · 320×240 → 197 MB · 480×360 → 442 MB
+#define POCKETGS_K_MAX 128
 
 constant float SH_C0 = 0.28209479177387814f;
 constant float SH_C1 = 0.4886025119029199f;
