@@ -415,6 +415,9 @@ struct FusedTensorCache {
     MTensor pgs_cache_alpha;      // [H, W, K]      float32
     MTensor pgs_cache_count;      // [H, W]         int32 (atomic during forward)
     MTensor pgs_overflow_count;   // [1]            int32 (atomic counter)
+    // Phase B: per-(pixel, chunk) count of cached contributors. Re-allocated
+    // alongside chunk_T/C/final_idx in ensure_chunks when K_max changes.
+    MTensor pgs_chunk_cache_count; // [K_max, H, W] int32
 
     // Step 2c parity test: shadow gradient buffers — the cache-driven
     // backward writes its result here so we can diff against the legacy
@@ -485,6 +488,7 @@ struct FusedTensorCache {
         chunk_final_idx = mtensor_empty(dev, {K, ih, iw}, DType::Int32);
         prefix_T = mtensor_empty(dev, {K, ih, iw}, DType::Float32);
         after_C = mtensor_empty(dev, {K, ih, iw, 3}, DType::Float32);
+        pgs_chunk_cache_count = mtensor_empty(dev, {K, ih, iw}, DType::Int32);
     }
 
     void ensure_backward(int np, int frb, id<MTLDevice> dev) {
@@ -785,6 +789,13 @@ static void forward_pipeline(
         ENC_BUF(enc, g_tcache.chunk_T, 7); ENC_BUF(enc, g_tcache.chunk_C, 8); ENC_BUF(enc, g_tcache.chunk_final_idx, 9);
         ENC_SCALAR(enc, CHUNK_SIZE, 10); ENC_SCALAR(enc, K_max, 11);
         [enc setBytes:block_size_dim2->data() length:sizeof(*block_size_dim2) atIndex:12];
+        // PocketGS Phase B cache args.
+        ENC_BUF(enc, gaussian_ids,                 13);
+        ENC_BUF(enc, g_tcache.pgs_cache_ids,       14);
+        ENC_BUF(enc, g_tcache.pgs_cache_Cin,       15);
+        ENC_BUF(enc, g_tcache.pgs_cache_alpha,     16);
+        ENC_BUF(enc, g_tcache.pgs_chunk_cache_count, 17);
+        ENC_BUF(enc, g_tcache.pgs_overflow_count,  18);
         [enc dispatchThreadgroups:chunked_tg threadsPerThreadgroup:tg_size];
 
         // Phase 2: merge kernel — one thread per pixel
@@ -796,6 +807,12 @@ static void forward_pipeline(
         ENC_BUF(enc, final_Ts, 5); ENC_BUF(enc, final_idx, 6); ENC_BUF(enc, out_img, 7);
         ENC_BUF(enc, background, 8);
         [enc setBytes:img_sz_2->data() length:sizeof(*img_sz_2) atIndex:9];
+        // PocketGS Phase B compaction args.
+        ENC_BUF(enc, g_tcache.pgs_chunk_cache_count, 10);
+        ENC_BUF(enc, g_tcache.pgs_cache_ids,         11);
+        ENC_BUF(enc, g_tcache.pgs_cache_Cin,         12);
+        ENC_BUF(enc, g_tcache.pgs_cache_alpha,       13);
+        ENC_BUF(enc, g_tcache.pgs_cache_count,       14);
         [enc dispatchThreads:MTLSizeMake(img_width, img_height, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
     };
 
@@ -839,13 +856,19 @@ static void forward_pipeline(
     // tile distributions. Overestimate is cheap: empty chunks early-exit immediately.
     // If the densest tile exceeds K_max * CHUNK_SIZE, those gaussians are silently
     // skipped — but 6x covers typical skew (measured max/avg ratio: ~1.5-2.5x).
-    // PocketGS Step 1: force monolithic path. The replay cache is only wired
-    // into nd_rasterize_forward_kernel; the chunked path's two-phase encode
-    // would also need matching writes (Phase B work). Until that lands keep
-    // K_max=1 so the cache is always populated. Slight perf cost at small
-    // image sizes (num_tiles < 400) where chunking helps GPU occupancy.
-    K_max = 1;
-    (void)CHUNK_SIZE; (void)capacity;
+    // PocketGS Phase B: chunked path now writes the replay cache too. Re-enable
+    // the original K_max heuristic — monolithic at high tile counts, chunked
+    // when tiles < 400 (better GPU occupancy at low res).
+    if (num_tiles >= 400) {
+        K_max = 1;
+    } else {
+        uint32_t avg_per_tile = (uint32_t)(capacity / std::max(1, num_tiles));
+        uint32_t conservative_max = avg_per_tile * 6;
+        K_max = (conservative_max + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        if (K_max < 2) K_max = 2;
+        uint32_t abs_max = (uint32_t)((capacity + CHUNK_SIZE - 1) / CHUNK_SIZE);
+        if (K_max > abs_max) K_max = abs_max;
+    }
     g_tcache.current_K_max = K_max;
     if (K_max > 1) {
         g_tcache.ensure_chunks(K_max, img_height, img_width, ctx->device);
@@ -1194,6 +1217,13 @@ std::tuple<MTensor, float> msplat_train_step(
             ENC_BUF(enc, g_tcache.chunk_T, 7); ENC_BUF(enc, g_tcache.chunk_C, 8); ENC_BUF(enc, g_tcache.chunk_final_idx, 9);
             ENC_SCALAR(enc, CHUNK_SIZE, 10); ENC_SCALAR(enc, K_max, 11);
             [enc setBytes:block_size_dim2->data() length:sizeof(*block_size_dim2) atIndex:12];
+            // PocketGS Phase B cache args.
+            ENC_BUF(enc, gaussian_ids,                 13);
+            ENC_BUF(enc, g_tcache.pgs_cache_ids,       14);
+            ENC_BUF(enc, g_tcache.pgs_cache_Cin,       15);
+            ENC_BUF(enc, g_tcache.pgs_cache_alpha,     16);
+            ENC_BUF(enc, g_tcache.pgs_chunk_cache_count, 17);
+            ENC_BUF(enc, g_tcache.pgs_overflow_count,  18);
             [enc dispatchThreadgroups:MTLSizeMake(tile_x, tile_y, K_max) threadsPerThreadgroup:MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1)];
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             // Merge
@@ -1203,6 +1233,12 @@ std::tuple<MTensor, float> msplat_train_step(
             ENC_BUF(enc, final_Ts, 5); ENC_BUF(enc, final_idx, 6); ENC_BUF(enc, out_img, 7);
             ENC_BUF(enc, background, 8);
             [enc setBytes:img_sz_2->data() length:sizeof(*img_sz_2) atIndex:9];
+            // PocketGS Phase B compaction args.
+            ENC_BUF(enc, g_tcache.pgs_chunk_cache_count, 10);
+            ENC_BUF(enc, g_tcache.pgs_cache_ids,         11);
+            ENC_BUF(enc, g_tcache.pgs_cache_Cin,         12);
+            ENC_BUF(enc, g_tcache.pgs_cache_alpha,       13);
+            ENC_BUF(enc, g_tcache.pgs_cache_count,       14);
             [enc dispatchThreads:MTLSizeMake(img_width, img_height, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
         }
     };
@@ -1433,6 +1469,9 @@ std::tuple<MTensor, float> msplat_train_step(
         // PocketGS per-iteration atomic resets (see comment in the other do-blit-zero block).
         [blit fillBuffer:g_tcache.pgs_cache_count.buffer() range:NSMakeRange(0, g_tcache.pgs_cache_count.nbytes()) value:0];
         [blit fillBuffer:g_tcache.pgs_overflow_count.buffer() range:NSMakeRange(0, g_tcache.pgs_overflow_count.nbytes()) value:0];
+        if (g_tcache.pgs_chunk_cache_count.defined()) {
+            [blit fillBuffer:g_tcache.pgs_chunk_cache_count.buffer() range:NSMakeRange(0, g_tcache.pgs_chunk_cache_count.nbytes()) value:0];
+        }
         [blit fillBuffer:v_xy.buffer() range:NSMakeRange(0, v_xy.nbytes()) value:0];
         [blit fillBuffer:v_conic.buffer() range:NSMakeRange(0, v_conic.nbytes()) value:0];
         [blit fillBuffer:v_colors_rast.buffer() range:NSMakeRange(0, v_colors_rast.nbytes()) value:0];

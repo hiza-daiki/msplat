@@ -2830,6 +2830,16 @@ kernel void rasterize_forward_chunked_kernel(
     constant uint& chunk_size,
     constant uint& K_max,
     constant uint2& blockDim,
+    // PocketGS Phase B: cache writes for the chunked forward path. Each
+    // (pixel, chunk) gets `K_per_chunk = POCKETGS_K_MAX / K_max` slots in
+    // the canonical cache; Cin is stored *local to the chunk* (T starts at
+    // 1 inside the chunk) and the merge kernel converts it to global Cin.
+    constant int* gaussian_ids_sorted,         // sorted_idx → canonical id
+    device int* pgs_cache_ids,                 // [H*W*K_MAX] int
+    device float* pgs_cache_Cin,               // [H*W*K_MAX*3] float (local Cin per chunk)
+    device float* pgs_cache_alpha,             // [H*W*K_MAX] float
+    device int* pgs_chunk_cache_count,         // [H*W*K_max] (per-chunk count)
+    device atomic_int* pgs_overflow_count,     // [1] global overflow counter
     uint3 blockIdx [[threadgroup_position_in_grid]],
     uint tr [[thread_index_in_threadgroup]]
 ) {
@@ -2878,6 +2888,11 @@ kernel void rasterize_forward_chunked_kernel(
     float3 pix_out = {0.f, 0.f, 0.f};
     int last_contributor = chunk_start - 1;
     bool done = false;
+    int pgs_k = 0; // contributors cached for this (pixel, chunk)
+    bool pgs_overflowed = false;
+    // Slot range available to chunk k = [k*K_per_chunk, (k+1)*K_per_chunk).
+    const uint K_per_chunk = POCKETGS_K_MAX / max((uint)1, K_max);
+    const uint chunk_base = k * K_per_chunk;
 
     for (int b = 0; b < num_batches; ++b) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2910,6 +2925,22 @@ kernel void rasterize_forward_chunked_kernel(
                 done = true;
                 break;
             }
+            // PocketGS Phase B: record this contributor in the canonical
+            // cache at the chunk's slot range. Cin stored is *local* to
+            // the chunk (T starts at 1 within chunk); merge converts.
+            if ((uint)pgs_k < K_per_chunk) {
+                const int sorted_idx = batch_start + t;
+                const int canonical_id = gaussian_ids_sorted[sorted_idx];
+                const int slot = (int)pix_id * POCKETGS_K_MAX + (int)chunk_base + pgs_k;
+                pgs_cache_ids[slot]            = canonical_id;
+                pgs_cache_Cin[slot * 3 + 0]    = pix_out.x;
+                pgs_cache_Cin[slot * 3 + 1]    = pix_out.y;
+                pgs_cache_Cin[slot * 3 + 2]    = pix_out.z;
+                pgs_cache_alpha[slot]          = alpha;
+                pgs_k += 1;
+            } else if (!pgs_overflowed) {
+                pgs_overflowed = true;
+            }
             const float vis = alpha * T;
             pix_out = fma(rgbs_batch[t], vis, pix_out);
             T = next_T;
@@ -2923,6 +2954,10 @@ kernel void rasterize_forward_chunked_kernel(
         chunk_C[out_offset * 3 + 1] = pix_out.y;
         chunk_C[out_offset * 3 + 2] = pix_out.z;
         chunk_final_idx[out_offset] = last_contributor;
+        pgs_chunk_cache_count[k * num_pixels + (uint)pix_id] = pgs_k;
+        if (pgs_overflowed) {
+            atomic_fetch_add_explicit(pgs_overflow_count, 1, memory_order_relaxed);
+        }
     }
 }
 
@@ -2940,6 +2975,13 @@ kernel void rasterize_forward_merge_kernel(
     device float* out_img,          // [H, W, 3]
     constant float* background,
     constant uint2& img_size,       // (W, H)
+    // PocketGS Phase B: in-place compaction + local→global Cin transform
+    // of the per-(pixel, chunk) cache entries written by the chunked kernel.
+    constant int* pgs_chunk_cache_count, // [K_max, H, W]
+    device int* pgs_cache_ids,           // [H, W, K_MAX] (in-place compact)
+    device float* pgs_cache_Cin,         // [H, W, K_MAX, 3] (in-place compact + transform)
+    device float* pgs_cache_alpha,       // [H, W, K_MAX] (in-place compact)
+    device int* pgs_cache_count,         // [H, W] — write total count after compact
     uint2 gp [[thread_position_in_grid]]
 ) {
     uint px = gp.x;
@@ -2952,11 +2994,41 @@ kernel void rasterize_forward_merge_kernel(
     int last_idx = -1;
     uint cutoff_k = K_max; // chunk index where absolute T cutoff triggered
 
+    // Cache compaction state.
+    const uint K_per_chunk = POCKETGS_K_MAX / max((uint)1, K_max);
+    uint pgs_dst = 0;
+
     for (uint k = 0; k < K_max; ++k) {
         uint offset = k * num_pixels + pix_id;
         int cfidx = chunk_final_idx[offset];
         if (cfidx < 0 && k > 0) break; // empty chunk after first real one = done
-        // Even if cfidx == chunk_start-1 (no contribution), chunk_T=1 and chunk_C=0
+
+        // ---- Cache compaction for this chunk ----
+        // Read per-chunk count, transform local Cin → global Cin using the
+        // running (T_running, C_running) snapshot from BEFORE this chunk's
+        // contribution lands in C_running / T_running.
+        int count_k = pgs_chunk_cache_count[offset];
+        const float3 T_run = float3(T_running, T_running, T_running);
+        const uint src_base = pix_id * POCKETGS_K_MAX + k * K_per_chunk;
+        for (int j = 0; j < count_k; ++j) {
+            const uint src_slot = src_base + (uint)j;
+            const uint dst_slot = pix_id * POCKETGS_K_MAX + pgs_dst;
+            const int id = pgs_cache_ids[src_slot];
+            const float a = pgs_cache_alpha[src_slot];
+            const float3 local_Cin = float3(pgs_cache_Cin[src_slot * 3 + 0],
+                                            pgs_cache_Cin[src_slot * 3 + 1],
+                                            pgs_cache_Cin[src_slot * 3 + 2]);
+            const float3 global_Cin = fma(T_run, local_Cin, C_running);
+            // dst_slot ≤ src_slot always (count_so_far ≤ k·K_per_chunk),
+            // so writing back to the same buffer is safe.
+            pgs_cache_ids[dst_slot] = id;
+            pgs_cache_alpha[dst_slot] = a;
+            pgs_cache_Cin[dst_slot * 3 + 0] = global_Cin.x;
+            pgs_cache_Cin[dst_slot * 3 + 1] = global_Cin.y;
+            pgs_cache_Cin[dst_slot * 3 + 2] = global_Cin.z;
+            pgs_dst += 1;
+        }
+
         float cT = chunk_T[offset];
         float3 cC = {chunk_C[offset * 3 + 0], chunk_C[offset * 3 + 1], chunk_C[offset * 3 + 2]};
         C_running = fma(cC, T_running, C_running);
@@ -2975,6 +3047,7 @@ kernel void rasterize_forward_merge_kernel(
         chunk_final_idx[k * num_pixels + pix_id] = -1;
     }
 
+    pgs_cache_count[pix_id] = (int)pgs_dst;
     final_Ts[pix_id] = T_running;
     final_index[pix_id] = last_idx;
     float3 bg = {background[0], background[1], background[2]};
