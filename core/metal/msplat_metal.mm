@@ -351,10 +351,14 @@ void msplat_drain_stage_times(std::vector<double> stage_times[], int max_stages,
 // Memory cost per pixel = K * 20 = 2560 bytes.
 static constexpr uint32_t POCKETGS_K_MAX = 128;
 
-// Step 2b: dispatch toggle. 0 = legacy per-tile-replay backward (default,
-// safe baseline). 1 = cache-driven backward (pgs_rasterize_backward_kernel).
-// Flip to 1 once the parity test in Step 2c passes.
-#define POCKETGS_USE_CACHE_BACKWARD 1
+// Step 2b: dispatch toggle. 0 = legacy per-tile-replay backward.
+// 1 = cache-driven backward (pgs_rasterize_backward_kernel).
+//
+// Reverted to 0 after the first on-device A/B showed obvious quality
+// regression (heavy magenta-bg bleed-through, spike noise on left edge).
+// The kernel math matches legacy line-for-line on paper; root cause TBD.
+// Re-enable after the parity test in Step 2c finds the discrepancy.
+#define POCKETGS_USE_CACHE_BACKWARD 0
 
 // Cached buffer pool — all intermediate GPU buffers are reused across iterations.
 // Sizes only change at densification (every 100 steps); between densifications
