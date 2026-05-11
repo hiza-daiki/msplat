@@ -347,10 +347,10 @@ void msplat_drain_stage_times(std::vector<double> stage_times[], int max_stages,
 #define RAST_BLOCK_Y 8
 
 // PocketGS replay cache size — must match POCKETGS_K_MAX in msplat_metal.metal.
-// Back to 128 for the Step 2c parity test (cache must hold every contributor
-// so the cache-driven backward computes correct gradients to diff against
-// legacy).
-static constexpr uint32_t POCKETGS_K_MAX = 128;
+// Trimmed 128 → 64 once we disabled the msplat resolution pyramid and started
+// training at full base resolution. Cache memory at 640×480·K=64 is 393 MB
+// (vs 786 MB at K=128), which keeps us under the Pro 6 GB jetsam.
+static constexpr uint32_t POCKETGS_K_MAX = 64;
 
 // Step 2b: dispatch toggle. 0 = legacy per-tile-replay backward.
 // 1 = cache-driven backward (pgs_rasterize_backward_kernel).

@@ -16,16 +16,16 @@ using namespace metal;
 // the *incoming* pixel color (before this gaussian blended), and the alpha
 // used. Backward consumes this directly instead of replaying the tile sweep.
 //
-// K_MAX 128 — sized so cache overflow stays near 0 at our typical training
-// resolutions (160×120 / 320×240), which is required while Step 2c parity
-// test runs the cache-driven backward into shadow buffers. If only the
-// diagnostic stat is needed, K=32 would be enough; bumping back lets the
-// new backward consume every contributor and stay numerically faithful to
-// legacy.
-//
-// Memory per pixel = K * (4+12+4) = 20*128 = 2560 B.
-//   160×120 → 49 MB · 320×240 → 197 MB · 480×360 → 442 MB
-#define POCKETGS_K_MAX 128
+// K_MAX 64. We disabled msplat's progressive pyramid (numDownscales=0 from
+// the Swift trainer), so training is at full base resolution from iter 0.
+// At 640×480 (iPhone Pro Swift downscale=3) the cache is K·W·H·20 bytes:
+//   K=128 → 786 MB (overflows the 2 GB jetsam on Pro 6 GB devices)
+//   K=64  → 393 MB (comfortable)
+//   K=32  → 197 MB (safer, but ~30% overflow loses tail contributors)
+// 64 is the empirical sweet spot — parity test data showed avg_k ≈ 25–40
+// per pixel even at 320×240 mid-densification, so K=64 typically holds
+// every contributor.
+#define POCKETGS_K_MAX 64
 
 constant float SH_C0 = 0.28209479177387814f;
 constant float SH_C1 = 0.4886025119029199f;
