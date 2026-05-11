@@ -496,7 +496,7 @@ kernel void nd_rasterize_forward_kernel(
     device int* pgs_cache_ids,                 // [H*W*K] int
     device float* pgs_cache_Cin,               // [H*W*K*3] float (RGB before blend)
     device float* pgs_cache_alpha,             // [H*W*K] float
-    device atomic_int* pgs_cache_count,        // [H*W] (per-pixel valid entry count)
+    device int* pgs_cache_count,               // [H*W] (per-pixel valid entry count, plain store — one thread per pixel)
     device atomic_int* pgs_overflow_count,     // [1] (# pixels that hit K_MAX)
     uint2 blockIdx [[threadgroup_position_in_grid]],
     uint2 threadIdx [[thread_position_in_threadgroup]],
@@ -612,7 +612,10 @@ kernel void nd_rasterize_forward_kernel(
         final_Ts[pix_id] = T;
         final_index[pix_id] = last_contributor;
         // PocketGS: publish per-pixel valid count + bump overflow stat.
-        atomic_store_explicit(&pgs_cache_count[pix_id], pgs_k, memory_order_relaxed);
+        // Each pixel is written by exactly one thread so a plain store is
+        // race-free; we earlier used atomic_int but switched to int after
+        // verifying with a +1000 smoking-gun bias.
+        pgs_cache_count[pix_id] = pgs_k;
         if (pgs_overflowed) {
             atomic_fetch_add_explicit(pgs_overflow_count, 1, memory_order_relaxed);
         }

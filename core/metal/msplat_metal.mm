@@ -537,9 +537,11 @@ static void forward_pipeline(
             : 0;
         const double avg = total > 0 ? double(sum_counts) / double(total) : 0.0;
         fprintf(stderr,
-                "[PocketGS cache] iter=%d avg_k=%.1f max_k=%d overflow_px=%d (K_MAX=%u)\n",
+                "[PocketGS cache] iter=%d avg_k=%.1f max_k=%d overflow_px=%d "
+                "(K_MAX=%u, %dx%d)\n",
                 iter_count_oc, avg, (int)max_count, (int)overflow_px,
-                (unsigned)POCKETGS_K_MAX);
+                (unsigned)POCKETGS_K_MAX,
+                g_tcache.img_width, g_tcache.img_height);
     }
     int64_t capacity = (int64_t)num_points * g_tcache.capacity_multiplier;
     uint32_t channels = 3;
@@ -758,17 +760,13 @@ static void forward_pipeline(
     // tile distributions. Overestimate is cheap: empty chunks early-exit immediately.
     // If the densest tile exceeds K_max * CHUNK_SIZE, those gaussians are silently
     // skipped — but 6x covers typical skew (measured max/avg ratio: ~1.5-2.5x).
-    if (num_tiles >= 400) {
-        // High-res: enough tiles for good GPU occupancy, skip chunking
-        K_max = 1;
-    } else {
-        uint32_t avg_per_tile = (uint32_t)(capacity / std::max(1, num_tiles));
-        uint32_t conservative_max = avg_per_tile * 6;  // 6x average — covers heavy-tailed distributions
-        K_max = (conservative_max + CHUNK_SIZE - 1) / CHUNK_SIZE;
-        if (K_max < 2) K_max = 2;
-        uint32_t abs_max = (uint32_t)((capacity + CHUNK_SIZE - 1) / CHUNK_SIZE);
-        if (K_max > abs_max) K_max = abs_max;
-    }
+    // PocketGS Step 1: force monolithic path. The replay cache is only wired
+    // into nd_rasterize_forward_kernel; the chunked path's two-phase encode
+    // would also need matching writes (Phase B work). Until that lands keep
+    // K_max=1 so the cache is always populated. Slight perf cost at small
+    // image sizes (num_tiles < 400) where chunking helps GPU occupancy.
+    K_max = 1;
+    (void)CHUNK_SIZE; (void)capacity;
     g_tcache.current_K_max = K_max;
     if (K_max > 1) {
         g_tcache.ensure_chunks(K_max, img_height, img_width, ctx->device);
@@ -895,9 +893,11 @@ std::tuple<MTensor, float> msplat_train_step(
             : 0;
         const double avg = total > 0 ? double(sum_counts) / double(total) : 0.0;
         fprintf(stderr,
-                "[PocketGS cache] iter=%d avg_k=%.1f max_k=%d overflow_px=%d (K_MAX=%u)\n",
+                "[PocketGS cache] iter=%d avg_k=%.1f max_k=%d overflow_px=%d "
+                "(K_MAX=%u, %dx%d)\n",
                 iter_count_oc, avg, (int)max_count, (int)overflow_px,
-                (unsigned)POCKETGS_K_MAX);
+                (unsigned)POCKETGS_K_MAX,
+                g_tcache.img_width, g_tcache.img_height);
     }
     int64_t capacity = (int64_t)num_points * g_tcache.capacity_multiplier;
     uint32_t channels = 3;
@@ -965,18 +965,10 @@ std::tuple<MTensor, float> msplat_train_step(
     auto proj_bwd_isz = std::make_shared<std::array<uint32_t, 2>>(std::array<uint32_t, 2>{img_width, img_height});
 
     // --- K_max for chunked rasterization ---
+    // PocketGS Step 1: force monolithic (see forward_pipeline for full note).
     uint32_t K_max = 1;
     constexpr uint32_t CHUNK_SIZE = 512;
-    if (num_tiles >= 400) {
-        K_max = 1;
-    } else {
-        uint32_t avg_per_tile = (uint32_t)(capacity / std::max(1, num_tiles));
-        uint32_t conservative_max = avg_per_tile * 6;
-        K_max = (conservative_max + CHUNK_SIZE - 1) / CHUNK_SIZE;
-        if (K_max < 2) K_max = 2;
-        uint32_t abs_max = (uint32_t)((capacity + CHUNK_SIZE - 1) / CHUNK_SIZE);
-        if (K_max > abs_max) K_max = abs_max;
-    }
+    (void)CHUNK_SIZE; (void)capacity;
     g_tcache.current_K_max = K_max;
     if (K_max > 1) {
         g_tcache.ensure_chunks(K_max, img_height, img_width, ctx->device);
