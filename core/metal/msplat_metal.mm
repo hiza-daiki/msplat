@@ -355,18 +355,20 @@ static constexpr uint32_t POCKETGS_K_MAX = 128;
 // Step 2b: dispatch toggle. 0 = legacy per-tile-replay backward.
 // 1 = cache-driven backward (pgs_rasterize_backward_kernel).
 //
-// Reverted to 0 after the first on-device A/B showed obvious quality
-// regression (heavy magenta-bg bleed-through, spike noise on left edge).
-// The kernel math matches legacy line-for-line on paper; root cause TBD.
-// Re-enable after the parity test in Step 2c finds the discrepancy.
-#define POCKETGS_USE_CACHE_BACKWARD 0
+// Now defaults to 1 — Step 2c parity test (POCKETGS_PARITY_TEST=1) showed
+// the new kernel matches legacy at floating-point noise levels:
+//   xy abs ≤ 6e-9 / rel ≤ 7e-4
+//   conic abs ≤ 2.5e-3 / rel ≤ 2e-3   (largest; cn values themselves are O(1))
+//   rgb abs ≤ 6e-8 / rel ≤ 1e-3
+//   opacity abs ≤ 1e-8 / rel ≤ 7e-3
+// All "first nonzero" indices skip around iteration to iteration → no
+// systematic bias, just atomic_fetch_add ordering noise. Safe to flip.
+#define POCKETGS_USE_CACHE_BACKWARD 1
 
-// Step 2c parity test toggle. When 1, the cache-driven backward kernel is
-// dispatched *in addition* to the legacy one, writing into shadow gradient
-// buffers. Every 100 iters we read both buffer sets back and report the
-// max |v_legacy - v_shadow| per parameter group. Training itself is
-// unaffected (Adam still consumes the legacy v_* outputs).
-#define POCKETGS_PARITY_TEST 1
+// Step 2c parity test toggle. Off now that the new kernel is validated;
+// re-enable when porting cache writes to the chunked forward path (Phase B)
+// or when rebasing msplat upstream.
+#define POCKETGS_PARITY_TEST 0
 
 // Cached buffer pool — all intermediate GPU buffers are reused across iterations.
 // Sizes only change at densification (every 100 steps); between densifications
