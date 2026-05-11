@@ -60,22 +60,98 @@ Model::Model(const InputData &inputData, int numCameras,
     means = gpu_empty({numPoints, 3}, DType::Float32);
     memcpy(means.data_ptr(), inputData.points.xyz.data(), numPoints * 3 * sizeof(float));
 
-    // Scales: log(KNN distance to nearest neighbours)
+    // PocketGS (arXiv:2601.17354) §III-B: KNN base scale with K=3 (tightens
+    // initial gaussian footprint vs msplat's default K=4).
+    std::vector<float> baseScale;
     {
         PointsTensor pt(inputData.points.xyz.data(), numPoints);
-        auto baseScale = pt.scales();
-        scales = gpu_empty({numPoints, 3}, DType::Float32);
-        float *sp = scales.data<float>();
+        baseScale = pt.scales(3);
+    }
+
+    // Anisotropic init when every point carries a surface normal (PocketGS
+    // §III-B): tangent dirs get the KNN scale, normal direction gets 0.3× of
+    // it → disc-like primitives that align to the local surface. Falls back
+    // to isotropic + random quaternions if no normals (e.g. depth-fallback
+    // point cloud).
+    const bool useAnisotropic = !inputData.points.normals.empty()
+                              && (int64_t)inputData.points.normals.size() == numPoints * 3;
+    static constexpr float kNormalScaleRatio = 0.3f;
+
+    scales = gpu_empty({numPoints, 3}, DType::Float32);
+    quats  = gpu_empty({numPoints, 4}, DType::Float32);
+    float *sp = scales.data<float>();
+    float *qp = quats.data<float>();
+
+    if (useAnisotropic) {
+        const float *nrm = inputData.points.normals.data();
+        for (int64_t i = 0; i < numPoints; i++) {
+            const float s = baseScale[i];
+            sp[i*3 + 0] = std::log(s);
+            sp[i*3 + 1] = std::log(s);
+            sp[i*3 + 2] = std::log(std::max(1e-6f, s * kNormalScaleRatio));
+
+            // Build orthonormal basis (t1, t2, n) where n = surface normal.
+            float nx = nrm[i*3 + 0], ny = nrm[i*3 + 1], nz = nrm[i*3 + 2];
+            float nlen = std::sqrt(nx*nx + ny*ny + nz*nz);
+            if (nlen < 1e-6f) {
+                qp[i*4 + 0] = 1; qp[i*4 + 1] = 0; qp[i*4 + 2] = 0; qp[i*4 + 3] = 0;
+                continue;
+            }
+            nx /= nlen; ny /= nlen; nz /= nlen;
+            // Seed not parallel to n
+            float sx = std::abs(nx) < 0.9f ? 1.0f : 0.0f;
+            float sy = std::abs(nx) < 0.9f ? 0.0f : 1.0f;
+            float sz_ = 0.0f;
+            // t1 = normalize(seed - dot(seed, n) * n)
+            float d = sx*nx + sy*ny + sz_*nz;
+            float t1x = sx - d*nx, t1y = sy - d*ny, t1z = sz_ - d*nz;
+            float t1len = std::sqrt(t1x*t1x + t1y*t1y + t1z*t1z);
+            t1x /= t1len; t1y /= t1len; t1z /= t1len;
+            // t2 = n × t1
+            float t2x = ny*t1z - nz*t1y;
+            float t2y = nz*t1x - nx*t1z;
+            float t2z = nx*t1y - ny*t1x;
+            // Rotation matrix R = [t1 | t2 | n] (columns) → quaternion (Shepperd).
+            float trace = t1x + t2y + nz;
+            float qw, qx, qy, qz;
+            if (trace > 0.0f) {
+                float s2 = std::sqrt(trace + 1.0f) * 2.0f;
+                qw = 0.25f * s2;
+                qx = (t2z - ny) / s2;
+                qy = (nx - t1z) / s2;
+                qz = (t1y - t2x) / s2;
+            } else if (t1x > t2y && t1x > nz) {
+                float s2 = std::sqrt(1.0f + t1x - t2y - nz) * 2.0f;
+                qw = (t2z - ny) / s2;
+                qx = 0.25f * s2;
+                qy = (t1y + t2x) / s2;
+                qz = (t1z + nx) / s2;
+            } else if (t2y > nz) {
+                float s2 = std::sqrt(1.0f + t2y - t1x - nz) * 2.0f;
+                qw = (nx - t1z) / s2;
+                qx = (t1y + t2x) / s2;
+                qy = 0.25f * s2;
+                qz = (ny + t2z) / s2;
+            } else {
+                float s2 = std::sqrt(1.0f + nz - t1x - t2y) * 2.0f;
+                qw = (t1y - t2x) / s2;
+                qx = (t1z + nx) / s2;
+                qy = (ny + t2z) / s2;
+                qz = 0.25f * s2;
+            }
+            qp[i*4 + 0] = qw;
+            qp[i*4 + 1] = qx;
+            qp[i*4 + 2] = qy;
+            qp[i*4 + 3] = qz;
+        }
+        std::fprintf(stderr,
+            "msplat: anisotropic init from %lld point normals (K=3)\n",
+            (long long)numPoints);
+    } else {
         for (int64_t i = 0; i < numPoints; i++) {
             float v = std::log(baseScale[i]);
             sp[i*3] = sp[i*3+1] = sp[i*3+2] = v;
         }
-    }
-
-    // Random quaternions
-    quats = gpu_empty({numPoints, 4}, DType::Float32);
-    {
-        float *qp = quats.data<float>();
         std::mt19937 rng(42);
         std::uniform_real_distribution<float> dist(0.0f, 1.0f);
         for (int64_t i = 0; i < numPoints; i++) {
@@ -85,6 +161,9 @@ Model::Model(const InputData &inputData, int numCameras,
             qp[i*4+2] = std::sqrt(u) * std::sin(2*M_PI*w);
             qp[i*4+3] = std::sqrt(u) * std::cos(2*M_PI*w);
         }
+        std::fprintf(stderr,
+            "msplat: isotropic init from %lld points (K=3, no normals)\n",
+            (long long)numPoints);
     }
 
     // SH features: f_dc = rgb2sh(rgb), f_rest = zeros

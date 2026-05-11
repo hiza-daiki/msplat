@@ -159,6 +159,22 @@ InputData loaders::loadColmap(const std::string &projectRoot, const std::string 
     else if (fs::exists(sparseDir + "/points3D.ply"))
         data.points = readPly(sparseDir + "/points3D.ply");
 
+    // Optional PocketGS normals sidecar — uint64 count + N*3 float32 (nx,ny,nz)
+    // in world space. Triggers anisotropic gaussian init in Model when every
+    // point carries a normal.
+    std::string normalsPath = sparseDir + "/points3D_normals.bin";
+    if (data.points.count > 0 && fs::exists(normalsPath)) {
+        std::ifstream nf(normalsPath, std::ios::binary);
+        uint64_t hdrCount = 0;
+        nf.read(reinterpret_cast<char*>(&hdrCount), 8);
+        if ((int64_t)hdrCount == data.points.count) {
+            data.points.normals.resize(data.points.count * 3);
+            nf.read(reinterpret_cast<char*>(data.points.normals.data()),
+                    data.points.normals.size() * sizeof(float));
+            if (!nf) data.points.normals.clear(); // partial read → bail
+        }
+    }
+
     autoScaleAndCenter(data);
     return data;
 }
