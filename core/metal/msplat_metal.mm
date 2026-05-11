@@ -343,10 +343,9 @@ void msplat_drain_stage_times(std::vector<double> stage_times[], int max_stages,
 #define RAST_BLOCK_Y 8
 
 // PocketGS replay cache size — must match POCKETGS_K_MAX in msplat_metal.metal.
-// Step 1 is write-only validation: enable allocation + kernel write, no
-// consumer yet. Memory cost per pixel = K * (4 + 12 + 4) = 80 bytes.
-// At 1280×720 with K=64 that's ~70 MB just for the cache.
-static constexpr uint32_t POCKETGS_K_MAX = 64;
+// Bumped 64 → 128 after Step 1 verification showed 5–15% overflow at 64.
+// Memory cost per pixel = K * 20 = 2560 bytes.
+static constexpr uint32_t POCKETGS_K_MAX = 128;
 
 // Cached buffer pool — all intermediate GPU buffers are reused across iterations.
 // Sizes only change at densification (every 100 steps); between densifications

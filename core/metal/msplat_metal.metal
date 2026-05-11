@@ -15,9 +15,15 @@ using namespace metal;
 // POCKETGS_K_MAX contributors. Each slot stores the canonical gaussian id,
 // the *incoming* pixel color (before this gaussian blended), and the alpha
 // used. Backward consumes this directly instead of replaying the tile sweep.
-// Step 1 of the rollout writes the cache but doesn't yet consume it — forward
-// output (out_img/final_Ts/final_idx) is bit-identical to the baseline path.
-#define POCKETGS_K_MAX 64
+//
+// K_MAX raised 64 → 128 after Step 1 verification on iPhone Pro: at 64 we
+// saw ~5–15% pixel overflow (avg_k ≈ 30–42, max_k pinned at the cap). For
+// Step 2 (cache-driven backward) the cache must hold every contributor or
+// the late ones get dropped from the gradient, so we size for the long tail.
+// Memory per pixel = K * (4+12+4) = 20*128 = 2560 B.
+//   160×120 → 49 MB · 240×320 → 197 MB · 480×360 → 442 MB
+// (the highest only kicks in after msplat's resolutionSchedule = 3000.)
+#define POCKETGS_K_MAX 128
 
 constant float SH_C0 = 0.28209479177387814f;
 constant float SH_C1 = 0.4886025119029199f;
