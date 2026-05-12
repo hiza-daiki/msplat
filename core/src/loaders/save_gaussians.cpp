@@ -14,7 +14,17 @@ void saveGaussianPly(const std::string &path, GaussianParams &p, int step) {
     int64_t N = p.means.size(0);
     int numDc = (int)p.featuresDc.size(1);
     int frBases = (int)p.featuresRest.size(-2);
-    int numFr = frBases * 3;
+
+    // MetalSplatter / SplatIO hardcode `sphericalHarmonicsCount = 45`
+    // (SH degree 3) and refuse to load PLYs that have fewer `f_rest_*`
+    // properties. Always export 45 to stay compatible regardless of the
+    // training shDegree. For models trained at shDegree<3 the extra
+    // coefficients are written as zeros — a no-op for SH evaluation.
+    // (Trade-off: if a shDegree=4+ model is ever exported this will clip
+    //  to 45 and lose the higher-frequency bands. Acceptable since msplat
+    //  configs we use cap at 3.)
+    constexpr int kExportFrBases = 15;          // (SH3 + 1)^2 - 1 = 15 per channel
+    constexpr int kExportNumFr = kExportFrBases * 3;
 
     o << "ply\nformat binary_little_endian 1.0\n";
     o << "comment msplat v" << step << "\n";
@@ -22,13 +32,13 @@ void saveGaussianPly(const std::string &path, GaussianParams &p, int step) {
     o << "property float x\nproperty float y\nproperty float z\n";
     o << "property float nx\nproperty float ny\nproperty float nz\n";
     for (int i = 0; i < numDc; i++) o << "property float f_dc_" << i << "\n";
-    for (int i = 0; i < numFr; i++) o << "property float f_rest_" << i << "\n";
+    for (int i = 0; i < kExportNumFr; i++) o << "property float f_rest_" << i << "\n";
     o << "property float opacity\n";
     o << "property float scale_0\nproperty float scale_1\nproperty float scale_2\n";
     o << "property float rot_0\nproperty float rot_1\nproperty float rot_2\nproperty float rot_3\n";
     o << "end_header\n";
 
-    int floatsPerRow = 3 + 3 + numDc + numFr + 1 + 3 + 4;
+    int floatsPerRow = 3 + 3 + numDc + kExportNumFr + 1 + 3 + 4;
     std::vector<float> row(floatsPerRow);
     const float *mp = p.means.data<float>(), *sp = p.scales.data<float>(), *qp = p.quats.data<float>();
     const float *dp = p.featuresDc.data<float>(), *op = p.opacities.data<float>();
@@ -40,10 +50,18 @@ void saveGaussianPly(const std::string &path, GaussianParams &p, int step) {
             row[c++] = p.keepCrs ? (mp[i*3+j] / p.scale + p.translation[j]) : mp[i*3+j];
         row[c++] = 0; row[c++] = 0; row[c++] = 0; // normals
         for (int j = 0; j < numDc; j++) row[c++] = dp[i*numDc+j];
-        // Transpose [frBases, 3] → [3, frBases] for PLY convention
-        for (int ch = 0; ch < 3; ch++)
-            for (int b = 0; b < frBases; b++)
-                row[c++] = frp[i*frBases*3 + b*3 + ch];
+        // Transpose [frBases, 3] → [3, frBases] for PLY convention.
+        // Pad each channel's tail with zeros up to kExportFrBases so the
+        // total f_rest count is always 45 (SH3 layout).
+        for (int ch = 0; ch < 3; ch++) {
+            for (int b = 0; b < kExportFrBases; b++) {
+                if (b < frBases) {
+                    row[c++] = frp[i*frBases*3 + b*3 + ch];
+                } else {
+                    row[c++] = 0.0f;
+                }
+            }
+        }
         row[c++] = op[i];
         for (int j = 0; j < 3; j++)
             row[c++] = p.keepCrs ? std::log(std::exp(sp[i*3+j]) / p.scale) : sp[i*3+j];

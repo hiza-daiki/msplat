@@ -351,9 +351,10 @@ void msplat_drain_stage_times(std::vector<double> stage_times[], int max_stages,
 #define RAST_BLOCK_Y 8
 
 // PocketGS replay cache size — must match POCKETGS_K_MAX in msplat_metal.metal.
-// Trimmed 64 → 32 after iter≥5000 hit jetsam: densif window doubles (1500 → 2500)
-// and gaussian count roughly doubles, so the Adam buffers need that headroom.
-// Cache memory at 320×240·K=32 is 49 MB (vs 98 MB at K=64).
+// Reverted to 32 after the 480×360 / K=16 attempt also jetsam'd: the cache
+// savings (-55 MB) didn't offset the resolution-driven Adam + render buffer
+// growth on iPhone Pro 6 GB. Back to 320×240 + K=32 + SH=3 which previously
+// completed iter=5000 with 162 k gaussians (~49 MB cache).
 static constexpr uint32_t POCKETGS_K_MAX = 32;
 
 // Step 2b: dispatch toggle. 0 = legacy per-tile-replay backward.

@@ -368,6 +368,62 @@ void Model::afterTrain(int step){
             std::cout << "Densified: " << numPointsBefore << " -> " << num_active << " gaussians" << std::endl;
         }
 
+        // PocketGS-style anisotropy clamp. msplat / Inria 3DGS have no
+        // explicit penalty on extreme scale anisotropy, so 1-view-optimized
+        // "needle" gaussians (max/min scale > 100x) accumulate during
+        // densification and dominate the rendered image with thin streaks
+        // ("針感"). Scaniverse exports empirically keep this ratio under
+        // ~13x at p99; we force the same by capping max/min ≤ kAnisoMaxRatio
+        // every refine cycle.
+        //
+        // Strategy: shrink the offending long axis (lo+log(ratio)) rather
+        // than growing the short axis — keeps the gaussian's small dimension
+        // intact, just trims the needle tail toward a disc/sphere.
+        //
+        // After clamping, zero the Adam moments for the scales group so
+        // accumulated momentum from before the clamp doesn't immediately
+        // re-grow the long axis on the next step.
+        {
+            // Aniso clamp ratio history: 6× → 4× → 5× — every value pegged
+            // basically 100% of the post-densif gaussian distribution at the
+            // clamp ceiling (p50 = p99 = ratio). Empirically the loss gradient
+            // *wants* scales above any clamp we set; hard-clamping forces the
+            // optimizer to use many spherical splats instead of fewer
+            // anisotropic ones, blowing up gaussian size and destroying thin-
+            // feature detail (text strokes, edges).
+            //
+            // Lifted to 20× to act as a "needle safety net" only — catches
+            // pathological gaussians (200×+ in the no-clamp era) while letting
+            // the natural anisotropy distribution emerge. Scaniverse p99 is
+            // 13×; 20× sits safely above that.
+            //
+            constexpr float kAnisoMaxRatio = 20.0f;
+            const float logRatio = std::log(kAnisoMaxRatio);
+            msplat_gpu_sync();
+            float *sp = scales.data<float>();
+            const int64_t N = num_active;
+            int64_t numClamped = 0;
+            for (int64_t i = 0; i < N; i++) {
+                const float s0 = sp[i*3 + 0];
+                const float s1 = sp[i*3 + 1];
+                const float s2 = sp[i*3 + 2];
+                const float lo = std::min({s0, s1, s2});
+                const float hi = std::max({s0, s1, s2});
+                if (hi - lo > logRatio) {
+                    const float cap = lo + logRatio;
+                    if (sp[i*3 + 0] > cap) sp[i*3 + 0] = cap;
+                    if (sp[i*3 + 1] > cap) sp[i*3 + 1] = cap;
+                    if (sp[i*3 + 2] > cap) sp[i*3 + 2] = cap;
+                    numClamped++;
+                }
+            }
+            if (numClamped > 0) {
+                fprintf(stderr,
+                        "Anisotropy clamp (ratio <= %.1fx): %lld/%lld gaussians at step %d\n",
+                        kAnisoMaxRatio, (long long)numClamped, (long long)N, step);
+            }
+        }
+
         if (step < stopSplitAt && step % resetInterval == refineEvery){
             msplat_gpu_sync();
             constexpr float resetLogit = -1.3862943611198906f;

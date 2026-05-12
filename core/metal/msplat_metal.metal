@@ -16,15 +16,17 @@ using namespace metal;
 // the *incoming* pixel color (before this gaussian blended), and the alpha
 // used. Backward consumes this directly instead of replaying the tile sweep.
 //
-// K_MAX 32. Training is locked at 320×240 (Swift sets numDownscales=1 and
-// resolutionSchedule past `iterations` so the pyramid never resolves to 1×).
-// Cache memory is K·W·H·20 bytes (ids=4 + Cin=12 + alpha=4):
-//   K=64 → 98 MB (was OK at iter≤3000 but jetsam at iter=5000 once
-//                 densification ran 2500 iter and gaussian count doubled)
-//   K=32 → 49 MB (current — frees ~49 MB for Adam buffers / gaussian growth
-//                 so iter≥5000 fits the 3 GB jetsam window on iPhone Pro)
-// avg_k ≈ 25–40 mid-densification means K=32 will overflow on the busiest
-// pixels; those fall through to the legacy backward path for tail contributors.
+// K_MAX history:
+//   K=128 → 786 MB @640×480 (jetsam on 6 GB Pro)
+//   K=64  → 98 MB @320×240 (OK at iter=3000, jetsam at iter=5000)
+//   K=32  → 49 MB @320×240 (worked at iter=5000 SH=3 162k gaussians — current)
+//   K=32  → 110 MB @480×360 (jetsam @ resolution bump)
+//   K=16  → 55 MB @480×360 (also jetsam'd — SH=3 Adam buffers overwhelmed
+//                            the cache savings on iPhone Pro 6 GB)
+//
+// Cache memory: K·W·H·20 bytes (ids=4 + Cin=12 + alpha=4).
+// avg_k ≈ 25–35 mid-densification on iPhone Pro scenes — K=32 fits this
+// distribution comfortably; only the busiest pixels lose tail contributors.
 #define POCKETGS_K_MAX 32
 
 constant float SH_C0 = 0.28209479177387814f;
