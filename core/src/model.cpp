@@ -68,11 +68,14 @@ Model::Model(const InputData &inputData, int numCameras,
         baseScale = pt.scales(3);
     }
 
-    // Anisotropic init when every point carries a surface normal (PocketGS
-    // §III-B): tangent dirs get the KNN scale, normal direction gets 0.3× of
-    // it → disc-like primitives that align to the local surface. Falls back
-    // to isotropic + random quaternions if no normals (e.g. depth-fallback
-    // point cloud).
+    // Anisotropic init when at least one point carries a surface normal
+    // (PocketGS §III-B): tangent dirs get the KNN scale, normal direction gets
+    // 0.3× → disc-like primitives aligned to the local surface. Mixed input is
+    // expected (mesh vertices have normals, depth-supplement points do not);
+    // per-point sentinel (nlen < 1e-6) means "no normal" → fall back to
+    // isotropic + random quaternion for THAT point while keeping anisotropic
+    // init for the rest. Falls back fully to isotropic if the sidecar is
+    // absent or malformed.
     const bool useAnisotropic = !inputData.points.normals.empty()
                               && (int64_t)inputData.points.normals.size() == numPoints * 3;
     static constexpr float kNormalScaleRatio = 0.3f;
@@ -82,21 +85,39 @@ Model::Model(const InputData &inputData, int numCameras,
     float *sp = scales.data<float>();
     float *qp = quats.data<float>();
 
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+    auto randomQuat = [&](float* qp_i) {
+        const float u = dist(rng), v = dist(rng), w = dist(rng);
+        qp_i[0] = std::sqrt(1-u) * std::sin(2*M_PI*v);
+        qp_i[1] = std::sqrt(1-u) * std::cos(2*M_PI*v);
+        qp_i[2] = std::sqrt(u)   * std::sin(2*M_PI*w);
+        qp_i[3] = std::sqrt(u)   * std::cos(2*M_PI*w);
+    };
+    auto isotropicScale = [&](int64_t i) {
+        const float v = std::log(baseScale[i]);
+        sp[i*3] = sp[i*3+1] = sp[i*3+2] = v;
+    };
+
     if (useAnisotropic) {
+        int64_t numAniso = 0, numIsoFallback = 0;
         const float *nrm = inputData.points.normals.data();
         for (int64_t i = 0; i < numPoints; i++) {
             const float s = baseScale[i];
-            sp[i*3 + 0] = std::log(s);
-            sp[i*3 + 1] = std::log(s);
-            sp[i*3 + 2] = std::log(std::max(1e-6f, s * kNormalScaleRatio));
-
-            // Build orthonormal basis (t1, t2, n) where n = surface normal.
             float nx = nrm[i*3 + 0], ny = nrm[i*3 + 1], nz = nrm[i*3 + 2];
             float nlen = std::sqrt(nx*nx + ny*ny + nz*nz);
             if (nlen < 1e-6f) {
-                qp[i*4 + 0] = 1; qp[i*4 + 1] = 0; qp[i*4 + 2] = 0; qp[i*4 + 3] = 0;
+                // Per-point isotropic fallback (e.g., depth-supplement points
+                // without a surface normal).
+                isotropicScale(i);
+                randomQuat(&qp[i*4]);
+                numIsoFallback++;
                 continue;
             }
+            sp[i*3 + 0] = std::log(s);
+            sp[i*3 + 1] = std::log(s);
+            sp[i*3 + 2] = std::log(std::max(1e-6f, s * kNormalScaleRatio));
+            numAniso++;
             nx /= nlen; ny /= nlen; nz /= nlen;
             // Seed not parallel to n
             float sx = std::abs(nx) < 0.9f ? 1.0f : 0.0f;
@@ -145,24 +166,15 @@ Model::Model(const InputData &inputData, int numCameras,
             qp[i*4 + 3] = qz;
         }
         std::fprintf(stderr,
-            "msplat: anisotropic init from %lld point normals (K=3)\n",
-            (long long)numPoints);
+            "msplat: mixed init: %lld anisotropic + %lld isotropic-fallback (K=3, total=%lld)\n",
+            (long long)numAniso, (long long)numIsoFallback, (long long)numPoints);
     } else {
         for (int64_t i = 0; i < numPoints; i++) {
-            float v = std::log(baseScale[i]);
-            sp[i*3] = sp[i*3+1] = sp[i*3+2] = v;
-        }
-        std::mt19937 rng(42);
-        std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-        for (int64_t i = 0; i < numPoints; i++) {
-            float u = dist(rng), v = dist(rng), w = dist(rng);
-            qp[i*4+0] = std::sqrt(1-u) * std::sin(2*M_PI*v);
-            qp[i*4+1] = std::sqrt(1-u) * std::cos(2*M_PI*v);
-            qp[i*4+2] = std::sqrt(u) * std::sin(2*M_PI*w);
-            qp[i*4+3] = std::sqrt(u) * std::cos(2*M_PI*w);
+            isotropicScale(i);
+            randomQuat(&qp[i*4]);
         }
         std::fprintf(stderr,
-            "msplat: isotropic init from %lld points (K=3, no normals)\n",
+            "msplat: isotropic init from %lld points (K=3, no normals sidecar)\n",
             (long long)numPoints);
     }
 

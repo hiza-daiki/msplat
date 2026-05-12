@@ -133,6 +133,8 @@ struct MetalContext {
     id<MTLComputePipelineState> nd_rasterize_forward_kernel_cpso;
     // PocketGS Step 2: cache-driven backward (loaded but not yet wired into dispatch).
     id<MTLComputePipelineState> pgs_rasterize_backward_kernel_cpso;
+    // PocketGS Step 3 / T2: threadgroup-local index-mapped scatter (opt-in via POCKETGS_BACKWARD_TG).
+    id<MTLComputePipelineState> pgs_rasterize_backward_tg_kernel_cpso;
     // Tile-local sorting
     id<MTLComputePipelineState> scatter_to_prealloc_bins_kernel_cpso;
     id<MTLComputePipelineState> bitonic_sort_per_tile_kernel_cpso;
@@ -238,6 +240,8 @@ MetalContext* init_msplat_metal_context() {
     ctx->nd_rasterize_forward_kernel_cpso         = load(@"nd_rasterize_forward_kernel");
     // PocketGS Step 2 (cache-driven backward).
     ctx->pgs_rasterize_backward_kernel_cpso       = load(@"pgs_rasterize_backward_kernel");
+    // PocketGS Step 3 / T2 (threadgroup-local scatter).
+    ctx->pgs_rasterize_backward_tg_kernel_cpso    = load(@"pgs_rasterize_backward_tg_kernel");
     // Tile-local sorting
     ctx->scatter_to_prealloc_bins_kernel_cpso      = load(@"scatter_to_prealloc_bins_kernel");
     ctx->bitonic_sort_per_tile_kernel_cpso        = load(@"bitonic_sort_per_tile_kernel");
@@ -347,10 +351,10 @@ void msplat_drain_stage_times(std::vector<double> stage_times[], int max_stages,
 #define RAST_BLOCK_Y 8
 
 // PocketGS replay cache size — must match POCKETGS_K_MAX in msplat_metal.metal.
-// Trimmed 128 → 64 once we disabled the msplat resolution pyramid and started
-// training at full base resolution. Cache memory at 640×480·K=64 is 393 MB
-// (vs 786 MB at K=128), which keeps us under the Pro 6 GB jetsam.
-static constexpr uint32_t POCKETGS_K_MAX = 64;
+// Trimmed 64 → 32 after iter≥5000 hit jetsam: densif window doubles (1500 → 2500)
+// and gaussian count roughly doubles, so the Adam buffers need that headroom.
+// Cache memory at 320×240·K=32 is 49 MB (vs 98 MB at K=64).
+static constexpr uint32_t POCKETGS_K_MAX = 32;
 
 // Step 2b: dispatch toggle. 0 = legacy per-tile-replay backward.
 // 1 = cache-driven backward (pgs_rasterize_backward_kernel).
@@ -369,6 +373,23 @@ static constexpr uint32_t POCKETGS_K_MAX = 64;
 // re-enable when porting cache writes to the chunked forward path (Phase B)
 // or when rebasing msplat upstream.
 #define POCKETGS_PARITY_TEST 0
+
+// Step 3 / T2: threadgroup-local gradient scatter (PocketGS §III-C2). When
+// set to 1, the monolithic cache-driven backward dispatch swaps to
+// `pgs_rasterize_backward_tg_kernel`, which accumulates per-gaussian gradients
+// in a 256-slot threadgroup hash table and flushes once to device atomics at
+// the end of each 16×16 tile.
+//
+// Why off by default: the kernel uses threadgroup `atomic_float` and
+// `atomic_compare_exchange_weak_explicit` on `atomic_int`. Both are Metal
+// 3.0+ features (iOS 16+), available on every device we ship to (iOS 17+),
+// but the kernel hasn't been validated against the legacy path yet on real
+// scenes. Toggle to 1 once parity has been measured.
+//
+// Expected speedup: per-iter backward time should drop by 1.5–3× on dense
+// splat phases (high atomic contention regime). Iter 0 ≈ no improvement
+// (few gaussians per pixel), iter post-densif = biggest win.
+#define POCKETGS_BACKWARD_TG 0
 
 // Cached buffer pool — all intermediate GPU buffers are reused across iterations.
 // Sizes only change at densification (every 100 steps); between densifications
@@ -578,12 +599,15 @@ static void forward_pipeline(
             ? *g_tcache.pgs_overflow_count.data<int32_t>()
             : 0;
         const double avg = total > 0 ? double(sum_counts) / double(total) : 0.0;
+        const uint32_t k_max_now = g_tcache.current_K_max;
+        const char* path = (k_max_now <= 1) ? "MONO" : "CHUNK";
         fprintf(stderr,
                 "[PocketGS cache] iter=%d avg_k=%.1f max_k=%d overflow_px=%d "
-                "(K_MAX=%u, %dx%d)\n",
+                "(K_MAX=%u, %dx%d, path=%s K_max=%u, gaussians=%d, tiles=%d, caller=%s)\n",
                 iter_count_oc, avg, (int)max_count, (int)overflow_px,
                 (unsigned)POCKETGS_K_MAX,
-                g_tcache.img_width, g_tcache.img_height);
+                g_tcache.img_width, g_tcache.img_height,
+                path, (unsigned)k_max_now, g_tcache.fwd_num_points, num_tiles, "render");
 #if POCKETGS_PARITY_TEST
         if (g_tcache.pgs_shadow_v_xy.defined() && g_tcache.bwd_num_points > 0) {
             const int N = g_tcache.bwd_num_points;
@@ -869,6 +893,12 @@ static void forward_pipeline(
         uint32_t abs_max = (uint32_t)((capacity + CHUNK_SIZE - 1) / CHUNK_SIZE);
         if (K_max > abs_max) K_max = abs_max;
     }
+    // Hard cap: PocketGS chunked cache partitions K_MAX slots across K_max
+    // chunks (K_per_chunk = POCKETGS_K_MAX / K_max). When K_max > POCKETGS_K_MAX
+    // the divisor goes to 0 and the entire replay cache silently stops writing —
+    // observed as `avg_k=0 overflow_px=H*W` and the backward kernel computes
+    // no gradients. Force at least 1 slot per chunk.
+    if (K_max > (uint32_t)POCKETGS_K_MAX) K_max = (uint32_t)POCKETGS_K_MAX;
     g_tcache.current_K_max = K_max;
     if (K_max > 1) {
         g_tcache.ensure_chunks(K_max, img_height, img_width, ctx->device);
@@ -994,12 +1024,15 @@ std::tuple<MTensor, float> msplat_train_step(
             ? *g_tcache.pgs_overflow_count.data<int32_t>()
             : 0;
         const double avg = total > 0 ? double(sum_counts) / double(total) : 0.0;
+        const uint32_t k_max_now = g_tcache.current_K_max;
+        const char* path = (k_max_now <= 1) ? "MONO" : "CHUNK";
         fprintf(stderr,
                 "[PocketGS cache] iter=%d avg_k=%.1f max_k=%d overflow_px=%d "
-                "(K_MAX=%u, %dx%d)\n",
+                "(K_MAX=%u, %dx%d, path=%s K_max=%u, gaussians=%d, tiles=%d, caller=%s)\n",
                 iter_count_oc, avg, (int)max_count, (int)overflow_px,
                 (unsigned)POCKETGS_K_MAX,
-                g_tcache.img_width, g_tcache.img_height);
+                g_tcache.img_width, g_tcache.img_height,
+                path, (unsigned)k_max_now, g_tcache.fwd_num_points, num_tiles, "train");
 #if POCKETGS_PARITY_TEST
         if (g_tcache.pgs_shadow_v_xy.defined() && g_tcache.bwd_num_points > 0) {
             const int N = g_tcache.bwd_num_points;
@@ -1309,9 +1342,15 @@ std::tuple<MTensor, float> msplat_train_step(
 #if POCKETGS_USE_CACHE_BACKWARD
             // PocketGS Step 2b: cache-driven backward. One thread per pixel,
             // consumes the replay cache written by nd_rasterize_forward_kernel.
+            // Step 3 / T2 (POCKETGS_BACKWARD_TG=1) swaps to the TG-local scatter
+            // variant — identical math, ~32× fewer device atomics.
             auto img_sz_2 = std::make_shared<std::array<uint32_t, 2>>(
                 std::array<uint32_t, 2>{img_width, img_height});
+#if POCKETGS_BACKWARD_TG
+            [enc setComputePipelineState:ctx->pgs_rasterize_backward_tg_kernel_cpso];
+#else
             [enc setComputePipelineState:ctx->pgs_rasterize_backward_kernel_cpso];
+#endif
             [enc setBytes:img_sz_2->data() length:sizeof(*img_sz_2) atIndex:0];
             ENC_BUF(enc, xys,           1);
             ENC_BUF(enc, conics,        2);
@@ -1329,6 +1368,7 @@ std::tuple<MTensor, float> msplat_train_step(
             ENC_BUF(enc, v_colors_rast, 14);
             ENC_BUF(enc, v_opacity,     15);
             // Grid: one thread per pixel, no tile cooperation needed.
+            // TG kernel relies on threadgroup = 16×16 = 256 threads (= TBL slots).
             [enc dispatchThreads:MTLSizeMake(img_width, img_height, 1)
                 threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
 #else

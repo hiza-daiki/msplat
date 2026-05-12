@@ -16,16 +16,16 @@ using namespace metal;
 // the *incoming* pixel color (before this gaussian blended), and the alpha
 // used. Backward consumes this directly instead of replaying the tile sweep.
 //
-// K_MAX 64. We disabled msplat's progressive pyramid (numDownscales=0 from
-// the Swift trainer), so training is at full base resolution from iter 0.
-// At 640×480 (iPhone Pro Swift downscale=3) the cache is K·W·H·20 bytes:
-//   K=128 → 786 MB (overflows the 2 GB jetsam on Pro 6 GB devices)
-//   K=64  → 393 MB (comfortable)
-//   K=32  → 197 MB (safer, but ~30% overflow loses tail contributors)
-// 64 is the empirical sweet spot — parity test data showed avg_k ≈ 25–40
-// per pixel even at 320×240 mid-densification, so K=64 typically holds
-// every contributor.
-#define POCKETGS_K_MAX 64
+// K_MAX 32. Training is locked at 320×240 (Swift sets numDownscales=1 and
+// resolutionSchedule past `iterations` so the pyramid never resolves to 1×).
+// Cache memory is K·W·H·20 bytes (ids=4 + Cin=12 + alpha=4):
+//   K=64 → 98 MB (was OK at iter≤3000 but jetsam at iter=5000 once
+//                 densification ran 2500 iter and gaussian count doubled)
+//   K=32 → 49 MB (current — frees ~49 MB for Adam buffers / gaussian growth
+//                 so iter≥5000 fits the 3 GB jetsam window on iPhone Pro)
+// avg_k ≈ 25–40 mid-densification means K=32 will overflow on the busiest
+// pixels; those fall through to the legacy backward path for tail contributors.
+#define POCKETGS_K_MAX 32
 
 constant float SH_C0 = 0.28209479177387814f;
 constant float SH_C1 = 0.4886025119029199f;
@@ -1281,6 +1281,222 @@ kernel void pgs_rasterize_backward_kernel(
         atomic_fetch_add_explicit(v_xy + 2*id + 1, v_xy_local.y, memory_order_relaxed);
 
         atomic_fetch_add_explicit(v_opacity + id, v_opacity_local, memory_order_relaxed);
+    }
+}
+
+// PocketGS §III-C2 T2 "index-mapped gradient scatter".
+//
+// Identical math to pgs_rasterize_backward_kernel. The only change is *where*
+// the per-slot gradient lands: a 256-slot threadgroup hash table indexed by
+// gaussian id, flushed to global memory once per threadgroup.
+//
+// Why: the per-pixel kernel emits 9 device atomic_fetch_adds per cache slot
+// (v_xy×2, v_conic×3, v_rgb×3, v_opacity), and many neighboring pixels share
+// the same hot gaussian. Hot-gaussian contention dominates iter cost during
+// dense splat phases. Threadgroup-local accumulation collapses those hits to
+// 9 device atomics per (threadgroup, unique gaussian) — ~32× fewer global
+// atomics in the typical case.
+//
+// Hash strategy: Knuth multiplicative + linear probing, MAX_PROBE=16. If a
+// slot can't be claimed within the probe budget (table saturated with unique
+// ids), fall back to direct global atomics on that slot — slow but correct.
+//
+// Float threadgroup atomics caveat: Metal's iOS toolchain does not implement
+// `atomic_float` on `threadgroup` storage. We emulate float fadd via CAS on
+// `atomic_uint` with bit-cast (`as_type<float>` / `as_type<uint>`). On
+// contended slots the CAS loop iterates; this is still much cheaper than a
+// device atomic because the address lives in on-chip threadgroup memory.
+//
+// Threadgroup memory budget: TBL=256 slots × (4 ids + 8 v_xy + 12 v_conic +
+// 12 v_rgb + 4 v_opacity) = 10240 B. Well below the 32 KB cap.
+inline void pgs_atomic_fadd_tg(threadgroup atomic_uint* addr, float val) {
+    uint expected = atomic_load_explicit(addr, memory_order_relaxed);
+    uint desired;
+    do {
+        const float curr = as_type<float>(expected);
+        desired = as_type<uint>(curr + val);
+    } while (!atomic_compare_exchange_weak_explicit(
+                addr, &expected, desired,
+                memory_order_relaxed, memory_order_relaxed));
+}
+
+kernel void pgs_rasterize_backward_tg_kernel(
+    constant uint2& img_size,
+    constant float* xys,
+    constant float* conics,
+    constant float* colors,
+    constant float* opacities_log,
+    constant float* final_Ts,
+    constant float* background,
+    constant float* v_output,
+    constant int* pgs_cache_ids,
+    constant float* pgs_cache_Cin,
+    constant float* pgs_cache_alpha,
+    constant int* pgs_cache_count,
+    device atomic_float* v_xy,
+    device atomic_float* v_conic,
+    device atomic_float* v_rgb,
+    device atomic_float* v_opacity,
+    uint2 gp [[thread_position_in_grid]],
+    uint local_id [[thread_index_in_threadgroup]]
+) {
+    constexpr uint TBL = 256u;
+    constexpr int  EMPTY = -1;
+    constexpr uint MAX_PROBE = 16u;
+
+    threadgroup atomic_int   tg_ids   [TBL];
+    threadgroup atomic_uint  tg_vrgb  [TBL * 3];   // float bits
+    threadgroup atomic_uint  tg_vconic[TBL * 3];
+    threadgroup atomic_uint  tg_vxy   [TBL * 2];
+    threadgroup atomic_uint  tg_vop   [TBL];
+
+    // 256 threads/threadgroup, 256 slots → one slot per thread to init / flush.
+    atomic_store_explicit(&tg_ids[local_id], EMPTY, memory_order_relaxed);
+    for (uint c = 0; c < 3; ++c) {
+        atomic_store_explicit(&tg_vrgb  [local_id*3 + c], 0u, memory_order_relaxed);
+        atomic_store_explicit(&tg_vconic[local_id*3 + c], 0u, memory_order_relaxed);
+    }
+    atomic_store_explicit(&tg_vxy[local_id*2 + 0], 0u, memory_order_relaxed);
+    atomic_store_explicit(&tg_vxy[local_id*2 + 1], 0u, memory_order_relaxed);
+    atomic_store_explicit(&tg_vop[local_id],       0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int j = (int)gp.x;
+    const int i = (int)gp.y;
+    const bool active = (i < (int)img_size.y && j < (int)img_size.x);
+
+    if (active) {
+        const int pix_id = i * (int)img_size.x + j;
+        const int count  = pgs_cache_count[pix_id];
+        if (count > 0) {
+            const float px = (float)j;
+            const float py = (float)i;
+            const float3 v_out = float3(v_output[3*pix_id + 0],
+                                        v_output[3*pix_id + 1],
+                                        v_output[3*pix_id + 2]);
+            const float3 bg = float3(background[0], background[1], background[2]);
+            const float T_final = final_Ts[pix_id];
+            const float3 T_final_bg = T_final * bg;
+            (void)pgs_cache_Cin;
+
+            float  T = T_final;
+            float3 buffer = float3(0.0f, 0.0f, 0.0f);
+
+            for (int slot_i = count - 1; slot_i >= 0; --slot_i) {
+                const int   slot  = pix_id * POCKETGS_K_MAX + slot_i;
+                const int   id    = pgs_cache_ids[slot];
+                const float alpha = pgs_cache_alpha[slot];
+                if (alpha >= 0.999f) continue;
+
+                const float one_m_alpha = 1.0f - alpha;
+                const float ra = 1.0f / one_m_alpha;
+                T *= ra;
+                const float fac = alpha * T;
+
+                const float2 xy   = float2(xys[id*2 + 0], xys[id*2 + 1]);
+                const float3 cnc  = float3(conics[id*3 + 0], conics[id*3 + 1], conics[id*3 + 2]);
+                const float3 raw  = float3(colors[id*3 + 0], colors[id*3 + 1], colors[id*3 + 2]);
+                const float opac_logit = opacities_log[id];
+                const float opac = 1.0f / (1.0f + exp(-opac_logit));
+
+                const float2 delta = float2(xy.x - px, xy.y - py);
+                const float3 rgb_clamped = max(raw + 0.5f, 0.0f);
+
+                const float3 v_rgb_local = fac * v_out;
+                const float v_alpha =
+                    dot(fma(rgb_clamped, T, fma(-buffer, ra, -ra * T_final_bg)), v_out);
+                buffer = fma(rgb_clamped, fac, buffer);
+                const float v_sigma = -alpha * v_alpha;
+                const float3 v_conic_local = (0.5f * v_sigma) *
+                    float3(delta.x * delta.x, delta.x * delta.y, delta.y * delta.y);
+                const float2 v_xy_local = v_sigma *
+                    float2(fma(cnc.x, delta.x, cnc.y * delta.y),
+                           fma(cnc.y, delta.x, cnc.z * delta.y));
+                const float v_opacity_local = -v_sigma * (1.0f - opac);
+
+                // Insert or find slot via linear-probed Knuth hash.
+                uint h = ((uint)id * 2654435761u) & (TBL - 1u);
+                uint slot_idx = TBL; // sentinel = miss
+                for (uint probe = 0; probe < MAX_PROBE; ++probe) {
+                    int cur = atomic_load_explicit(&tg_ids[h], memory_order_relaxed);
+                    if (cur == id) { slot_idx = h; break; }
+                    if (cur == EMPTY) {
+                        int expected = EMPTY;
+                        if (atomic_compare_exchange_weak_explicit(
+                                &tg_ids[h], &expected, id,
+                                memory_order_relaxed, memory_order_relaxed)) {
+                            slot_idx = h; break;
+                        }
+                        if (expected == id) { slot_idx = h; break; }
+                    }
+                    h = (h + 1u) & (TBL - 1u);
+                }
+
+                if (slot_idx < TBL) {
+                    // TG accumulation: skip the rgb clamp gate here; the gate
+                    // depends only on `raw` (canonical per id) so applying it
+                    // once at flush time is mathematically identical.
+                    pgs_atomic_fadd_tg(&tg_vrgb  [slot_idx*3 + 0], v_rgb_local.x);
+                    pgs_atomic_fadd_tg(&tg_vrgb  [slot_idx*3 + 1], v_rgb_local.y);
+                    pgs_atomic_fadd_tg(&tg_vrgb  [slot_idx*3 + 2], v_rgb_local.z);
+                    pgs_atomic_fadd_tg(&tg_vconic[slot_idx*3 + 0], v_conic_local.x);
+                    pgs_atomic_fadd_tg(&tg_vconic[slot_idx*3 + 1], v_conic_local.y);
+                    pgs_atomic_fadd_tg(&tg_vconic[slot_idx*3 + 2], v_conic_local.z);
+                    pgs_atomic_fadd_tg(&tg_vxy   [slot_idx*2 + 0], v_xy_local.x);
+                    pgs_atomic_fadd_tg(&tg_vxy   [slot_idx*2 + 1], v_xy_local.y);
+                    pgs_atomic_fadd_tg(&tg_vop   [slot_idx],       v_opacity_local);
+                } else {
+                    // Hash saturated: fall back to direct global atomics
+                    // (identical to pgs_rasterize_backward_kernel).
+                    if (raw.x + 0.5f >= 0.0f)
+                        atomic_fetch_add_explicit(v_rgb + 3*id + 0, v_rgb_local.x, memory_order_relaxed);
+                    if (raw.y + 0.5f >= 0.0f)
+                        atomic_fetch_add_explicit(v_rgb + 3*id + 1, v_rgb_local.y, memory_order_relaxed);
+                    if (raw.z + 0.5f >= 0.0f)
+                        atomic_fetch_add_explicit(v_rgb + 3*id + 2, v_rgb_local.z, memory_order_relaxed);
+                    atomic_fetch_add_explicit(v_conic + 3*id + 0, v_conic_local.x, memory_order_relaxed);
+                    atomic_fetch_add_explicit(v_conic + 3*id + 1, v_conic_local.y, memory_order_relaxed);
+                    atomic_fetch_add_explicit(v_conic + 3*id + 2, v_conic_local.z, memory_order_relaxed);
+                    atomic_fetch_add_explicit(v_xy + 2*id + 0, v_xy_local.x, memory_order_relaxed);
+                    atomic_fetch_add_explicit(v_xy + 2*id + 1, v_xy_local.y, memory_order_relaxed);
+                    atomic_fetch_add_explicit(v_opacity + id, v_opacity_local, memory_order_relaxed);
+                }
+            }
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Flush: each thread owns one slot. If occupied, dump it to global
+    // with the rgb clamp gate evaluated once on the canonical raw color.
+    const int gid = atomic_load_explicit(&tg_ids[local_id], memory_order_relaxed);
+    if (gid >= 0) {
+        const float3 raw = float3(colors[gid*3 + 0], colors[gid*3 + 1], colors[gid*3 + 2]);
+
+        const float vrgb_x = as_type<float>(atomic_load_explicit(&tg_vrgb[local_id*3 + 0], memory_order_relaxed));
+        const float vrgb_y = as_type<float>(atomic_load_explicit(&tg_vrgb[local_id*3 + 1], memory_order_relaxed));
+        const float vrgb_z = as_type<float>(atomic_load_explicit(&tg_vrgb[local_id*3 + 2], memory_order_relaxed));
+        if (raw.x + 0.5f >= 0.0f)
+            atomic_fetch_add_explicit(v_rgb + 3*gid + 0, vrgb_x, memory_order_relaxed);
+        if (raw.y + 0.5f >= 0.0f)
+            atomic_fetch_add_explicit(v_rgb + 3*gid + 1, vrgb_y, memory_order_relaxed);
+        if (raw.z + 0.5f >= 0.0f)
+            atomic_fetch_add_explicit(v_rgb + 3*gid + 2, vrgb_z, memory_order_relaxed);
+
+        const float vconic_x = as_type<float>(atomic_load_explicit(&tg_vconic[local_id*3 + 0], memory_order_relaxed));
+        const float vconic_y = as_type<float>(atomic_load_explicit(&tg_vconic[local_id*3 + 1], memory_order_relaxed));
+        const float vconic_z = as_type<float>(atomic_load_explicit(&tg_vconic[local_id*3 + 2], memory_order_relaxed));
+        atomic_fetch_add_explicit(v_conic + 3*gid + 0, vconic_x, memory_order_relaxed);
+        atomic_fetch_add_explicit(v_conic + 3*gid + 1, vconic_y, memory_order_relaxed);
+        atomic_fetch_add_explicit(v_conic + 3*gid + 2, vconic_z, memory_order_relaxed);
+
+        const float vxy_x = as_type<float>(atomic_load_explicit(&tg_vxy[local_id*2 + 0], memory_order_relaxed));
+        const float vxy_y = as_type<float>(atomic_load_explicit(&tg_vxy[local_id*2 + 1], memory_order_relaxed));
+        atomic_fetch_add_explicit(v_xy + 2*gid + 0, vxy_x, memory_order_relaxed);
+        atomic_fetch_add_explicit(v_xy + 2*gid + 1, vxy_y, memory_order_relaxed);
+
+        const float vop = as_type<float>(atomic_load_explicit(&tg_vop[local_id], memory_order_relaxed));
+        atomic_fetch_add_explicit(v_opacity + gid, vop, memory_order_relaxed);
     }
 }
 
