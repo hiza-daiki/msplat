@@ -231,6 +231,11 @@ void Model::setupOptimizers(){
     for (int g = 0; g < N_ADAM_GROUPS; g++) {
         auto shape = params[g]->shape();
         shape[0] = buf_capacity;
+        // v6 attempted fp16 for featuresRest Adam state to free ~50 MB at
+        // peak buf_capacity. Combined with 480×360 it completed but with
+        // only 95 k gaussians (vs 179 k at v5 320×240 fp32), so each
+        // gaussian was 4× larger — net detail quality worse. Reverted to
+        // fp32 in v7.
         adam_exp_avg_buf[g] = gpu_zeros(shape, DType::Float32);
         adam_exp_avg_sq_buf[g] = gpu_zeros(shape, DType::Float32);
         adam_lr[g] = lr_init[g];
@@ -248,7 +253,12 @@ void Model::setupOptimizers(){
     int max_blocks = (buf_capacity + 1023) / 1024;
     densify_block_totals = gpu_zeros({max_blocks}, DType::Int32);
     int64_t fr_stride = featuresRest.numel() / featuresRest.size(0);
-    densify_compact_scratch = gpu_zeros({(int64_t)buf_capacity * fr_stride}, DType::Float32);
+    // Chunked compact scratch: size for one chunk = max(4, ceil(fr_stride/3))
+    // floats per element. featuresRest (the largest stride) is processed in
+    // 3 passes; small-stride buffers fit in a single pass. At buf_capacity =
+    // 500 k and SH=3 (fr_stride=45), this brings scratch from 90 MB → 30 MB.
+    int64_t chunk_stride = std::max((int64_t)4, (fr_stride + 2) / 3);
+    densify_compact_scratch = gpu_zeros({(int64_t)buf_capacity * chunk_stride}, DType::Float32);
     densify_random_samples = gpu_zeros({buf_capacity, 3}, DType::Float32);
 
     refreshViews();
@@ -292,8 +302,9 @@ void Model::ensureCapacity(int needed){
     auto grow = [&](MTensor &buf) {
         auto shape = buf.shape();
         shape[0] = new_cap;
-        MTensor new_buf = gpu_zeros(shape, DType::Float32);
-        size_t copy_bytes = num_active * buf.stride0() * sizeof(float);
+        DType dt = buf.dtype();  // preserve fp16 for featuresRest Adam buffers
+        MTensor new_buf = gpu_zeros(shape, dt);
+        size_t copy_bytes = num_active * buf.stride0() * dtypeSize(dt);
         memcpy(new_buf.data_ptr(), buf.data_ptr(), copy_bytes);
         buf = new_buf;
     };
@@ -312,7 +323,10 @@ void Model::ensureCapacity(int needed){
     int max_blocks = (new_cap + 1023) / 1024;
     densify_block_totals = gpu_zeros({max_blocks}, DType::Int32);
     int64_t fr_stride = featuresRest_buf.stride0();
-    densify_compact_scratch = gpu_zeros({(int64_t)new_cap * fr_stride}, DType::Float32);
+    // Chunked scratch — see comment in allocBufferPool. chunk_stride matches
+    // the dispatch loop in msplat_metal.mm's compact stage.
+    int64_t chunk_stride = std::max((int64_t)4, (fr_stride + 2) / 3);
+    densify_compact_scratch = gpu_zeros({(int64_t)new_cap * chunk_stride}, DType::Float32);
     densify_random_samples = gpu_zeros({new_cap, 3}, DType::Float32);
 
     buf_capacity = new_cap;
@@ -601,12 +615,16 @@ int Model::loadCheckpoint(const std::string &filename) {
     allocBuf(featuresRest_buf, featuresRest);
     allocBuf(opacities_buf, opacities);
 
-    // Copy optimizer state into oversized backing buffers
+    // Copy optimizer state into oversized backing buffers. featuresRest
+    // (group 4) preserves its loaded dtype — Float16 in v6+, Float32 in
+    // older checkpoints. allocBufferPool would have allocated Float16, but
+    // here we just preserve what readTensor returned (no implicit conversion).
     for (int g = 0; g < N_ADAM_GROUPS; g++) {
         auto shape = adam_exp_avg[g].shape();
         shape[0] = buf_capacity;
-        MTensor avg_buf = gpu_zeros(shape, DType::Float32);
-        MTensor sq_buf = gpu_zeros(shape, DType::Float32);
+        DType dt = adam_exp_avg[g].dtype();
+        MTensor avg_buf = gpu_zeros(shape, dt);
+        MTensor sq_buf = gpu_zeros(shape, dt);
         memcpy(avg_buf.data_ptr(), adam_exp_avg[g].data_ptr(), adam_exp_avg[g].nbytes());
         memcpy(sq_buf.data_ptr(), adam_exp_avg_sq[g].data_ptr(), adam_exp_avg_sq[g].nbytes());
         adam_exp_avg_buf[g] = avg_buf;
@@ -623,7 +641,9 @@ int Model::loadCheckpoint(const std::string &filename) {
     int max_blocks = (buf_capacity + 1023) / 1024;
     densify_block_totals = gpu_zeros({max_blocks}, DType::Int32);
     int64_t fr_stride = featuresRest.numel() / featuresRest.size(0);
-    densify_compact_scratch = gpu_zeros({(int64_t)buf_capacity * fr_stride}, DType::Float32);
+    // Chunked scratch — see comment in allocBufferPool.
+    int64_t chunk_stride = std::max((int64_t)4, (fr_stride + 2) / 3);
+    densify_compact_scratch = gpu_zeros({(int64_t)buf_capacity * chunk_stride}, DType::Float32);
     densify_random_samples = gpu_zeros({buf_capacity, 3}, DType::Float32);
 
     refreshViews();

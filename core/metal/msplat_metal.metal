@@ -21,12 +21,21 @@ using namespace metal;
 //   K=64  → 98 MB @320×240 (OK at iter=3000, jetsam at iter=5000)
 //   K=32  → 49 MB @320×240 (worked at iter=5000 SH=3 162k gaussians — current)
 //   K=32  → 110 MB @480×360 (jetsam @ resolution bump)
-//   K=16  → 55 MB @480×360 (also jetsam'd — SH=3 Adam buffers overwhelmed
-//                            the cache savings on iPhone Pro 6 GB)
+//   K=16  → 55 MB @480×360 + fp16 Adam: completed but with only 95k
+//                            gaussians (densif starved by weakened backward
+//                            cache + fp16 noise) — each gaussian grew to
+//                            15 mm radius vs 4 mm at v5 320×240. Net detail
+//                            quality WORSE than v5 despite 2.25× more pixels.
+//                            Rolled back.
+//
+// Final pick: K=32 @ 320×240, fp32 everywhere, ~179 k gaussians, 4 mm
+// gaussians. Best result iPhone Pro 6 GB can produce; further sharpness
+// requires either more RAM (iPad Pro M+, iPhone 15 Pro+) or off-device
+// training.
 //
 // Cache memory: K·W·H·20 bytes (ids=4 + Cin=12 + alpha=4).
-// avg_k ≈ 25–35 mid-densification on iPhone Pro scenes — K=32 fits this
-// distribution comfortably; only the busiest pixels lose tail contributors.
+// At K=32 with avg_k≈25-35 only the busiest pixels truncate the tail of
+// contributors from the cache-driven backward.
 #define POCKETGS_K_MAX 32
 
 constant float SH_C0 = 0.28209479177387814f;
@@ -2203,6 +2212,48 @@ inline void adam_update_element(
     eas = v;
 }
 
+// fp16 Adam-state variant: param stays fp32, but exp_avg / exp_avg_sq are
+// stored as half to halve their memory footprint. All math runs in fp32; the
+// half cast happens only on the final write-back.
+//
+// Two-sided clamp before the half cast:
+//   - v floor (1e-7): fp16 min normal is 6e-8, sub-normal values would round
+//     to zero and crash the sqrt(v) denominator.
+//   - m / v ceiling (32000): fp16 max is ~65504. Casting a larger float to
+//     half produces +inf, which propagates: `beta1*inf + ...` = inf, then
+//     `param -= step_size * inf / sqrt(inf)` = inf/inf = NaN. Empirically
+//     observed in a 5000-iter run without the upper clamp (some gaussians
+//     hit p50 radius = 105 mm with NaN scales).
+//   - The 32000 ceiling is well below the 65504 fp16 max so even Adam's
+//     beta-weighted accumulation can't push past it on the next step.
+inline void adam_update_element_fp16_state(
+    device float& param, device half& ea, device half& eas,
+    float grad, float step_size, float beta1, float beta2, float bc2_sqrt, float eps
+) {
+    // Defensive NaN/inf guards. Sources observed empirically:
+    //   - grad can be NaN if a degenerate viewdir normalize hit 0/0
+    //     (gaussian at camera position).
+    //   - ea / eas can drift to ±inf via accumulated fp16 overflow if a
+    //     bad grad slips through.
+    //   - clamp(NaN, ...) returns NaN in MSL, so we can't rely on it to
+    //     scrub; need explicit isfinite checks.
+    float ea_fp32  = (float)ea;
+    float eas_fp32 = (float)eas;
+    if (!isfinite(ea_fp32))  ea_fp32  = 0.0f;
+    if (!isfinite(eas_fp32)) eas_fp32 = 1.0e-7f;
+    if (!isfinite(grad))     grad     = 0.0f;
+
+    float m = fma(beta1, ea_fp32,  (1.0f - beta1) * grad);
+    float v = fma(beta2, eas_fp32, (1.0f - beta2) * grad * grad);
+
+    m = isfinite(m) ? clamp(m, -32000.0f, 32000.0f) : 0.0f;
+    v = isfinite(v) ? clamp(v,  1.0e-7f,  32000.0f) : 1.0e-7f;
+
+    param -= step_size * m / (sqrt(v) / bc2_sqrt + eps);
+    ea  = (half)m;
+    eas = (half)v;
+}
+
 // Packed Adam hyperparameters for SH groups (passed via setBytes)
 struct SHAdamParams {
     float dc_step_size;
@@ -4171,38 +4222,105 @@ kernel void densify_cull_classify_kernel(
 }
 
 // Scatter kept elements from src to dst at compacted positions.
-// One thread per float (elem * stride + sub).
+// One thread per float (elem * chunk_stride + sub).
+//
+// Chunked variant: `src_stride` is the original buffer's per-element stride
+// (e.g. 45 for SH=3 featuresRest), `chunk_stride` is the per-element stride
+// in the scratch dst buffer (= number of floats copied per element in this
+// pass), and `sub_start` selects which slice [sub_start, sub_start+chunk_stride)
+// of src we're copying. For non-chunked buffers callers pass
+// chunk_stride == src_stride and sub_start == 0; behaviour is identical to
+// the pre-chunking kernel. This lets us allocate a much smaller scratch
+// (chunk_stride floats per element instead of full fr_stride) which
+// previously dominated densify peak memory at SH=3.
 kernel void compact_scatter_kernel(
     constant float* src              [[buffer(0)]],
     device float* dst                [[buffer(1)]],
     constant int* keep_prefix        [[buffer(2)]],
     constant int* keep_flag          [[buffer(3)]],
     constant uint& N                 [[buffer(4)]],
-    constant uint& stride            [[buffer(5)]],
+    constant uint& src_stride        [[buffer(5)]],
+    constant uint& chunk_stride      [[buffer(6)]],
+    constant uint& sub_start         [[buffer(7)]],
     uint tid [[thread_position_in_grid]]
 ) {
-    uint elem = tid / stride;
-    uint sub  = tid % stride;
+    uint elem = tid / chunk_stride;
+    uint sub  = tid % chunk_stride;
     if (elem >= N || keep_flag[elem] == 0) return;
+    uint src_sub = sub_start + sub;
+    if (src_sub >= src_stride) return;
     int dst_elem = keep_prefix[elem] - 1;
-    dst[dst_elem * stride + sub] = src[elem * stride + sub];
+    dst[dst_elem * chunk_stride + sub] = src[elem * src_stride + src_sub];
+}
+
+// fp16 variant of compact_scatter_kernel — used for fp16-typed Adam state
+// buffers (currently just featuresRest's exp_avg / exp_avg_sq). Same
+// indexing logic as compact_scatter_kernel, half-typed buffers throughout.
+// The compact_scratch buffer is allocated as float32 in C++ but reused for
+// fp16 paths via reinterpretation; only the first half of the bytes is
+// touched since fp16 elements are half the size.
+kernel void compact_scatter_kernel_fp16(
+    constant half* src               [[buffer(0)]],
+    device half* dst                 [[buffer(1)]],
+    constant int* keep_prefix        [[buffer(2)]],
+    constant int* keep_flag          [[buffer(3)]],
+    constant uint& N                 [[buffer(4)]],
+    constant uint& src_stride        [[buffer(5)]],
+    constant uint& chunk_stride      [[buffer(6)]],
+    constant uint& sub_start         [[buffer(7)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint elem = tid / chunk_stride;
+    uint sub  = tid % chunk_stride;
+    if (elem >= N || keep_flag[elem] == 0) return;
+    uint src_sub = sub_start + sub;
+    if (src_sub >= src_stride) return;
+    int dst_elem = keep_prefix[elem] - 1;
+    dst[dst_elem * chunk_stride + sub] = src[elem * src_stride + src_sub];
 }
 
 // Copy compacted data from scratch back to original buffer.
-// Reads new_count from keep_prefix to determine bounds.
+// Chunked counterpart of compact_scatter_kernel — `src_stride` is the scratch
+// per-element stride (chunk_stride from the scatter pass), `dst_stride` is the
+// full buffer stride, and `sub_start` is the offset within each dst element
+// for this chunk.
 kernel void compact_copy_back_kernel(
     constant float* src              [[buffer(0)]],
     device float* dst                [[buffer(1)]],
     constant int* keep_prefix        [[buffer(2)]],
     constant uint& last_prefix_idx   [[buffer(3)]],  // N_new - 1 (or worst_case - 1)
-    constant uint& stride            [[buffer(4)]],
+    constant uint& src_stride        [[buffer(4)]],  // scratch stride (chunk size)
+    constant uint& dst_stride        [[buffer(5)]],  // full buffer stride
+    constant uint& sub_start         [[buffer(6)]],
     uint tid [[thread_position_in_grid]]
 ) {
     int new_count = keep_prefix[last_prefix_idx];
-    uint elem = tid / stride;
-    uint sub  = tid % stride;
+    uint elem = tid / src_stride;
+    uint sub  = tid % src_stride;
     if (elem >= (uint)new_count) return;
-    dst[elem * stride + sub] = src[elem * stride + sub];
+    uint dst_sub = sub_start + sub;
+    if (dst_sub >= dst_stride) return;
+    dst[elem * dst_stride + dst_sub] = src[elem * src_stride + sub];
+}
+
+// fp16 variant of compact_copy_back_kernel.
+kernel void compact_copy_back_kernel_fp16(
+    constant half* src               [[buffer(0)]],
+    device half* dst                 [[buffer(1)]],
+    constant int* keep_prefix        [[buffer(2)]],
+    constant uint& last_prefix_idx   [[buffer(3)]],
+    constant uint& src_stride        [[buffer(4)]],
+    constant uint& dst_stride        [[buffer(5)]],
+    constant uint& sub_start         [[buffer(6)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    int new_count = keep_prefix[last_prefix_idx];
+    uint elem = tid / src_stride;
+    uint sub  = tid % src_stride;
+    if (elem >= (uint)new_count) return;
+    uint dst_sub = sub_start + sub;
+    if (dst_sub >= dst_stride) return;
+    dst[elem * dst_stride + dst_sub] = src[elem * src_stride + sub];
 }
 
 // ============================================================================

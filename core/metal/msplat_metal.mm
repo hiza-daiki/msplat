@@ -164,6 +164,10 @@ struct MetalContext {
     id<MTLComputePipelineState> densify_cull_classify_kernel_cpso;
     id<MTLComputePipelineState> compact_scatter_kernel_cpso;
     id<MTLComputePipelineState> compact_copy_back_kernel_cpso;
+    // fp16 variants for featuresRest Adam state (Adam exp_avg / exp_avg_sq
+    // group index 4 — buffers 10 and 16 in the compact loop's all_bufs).
+    id<MTLComputePipelineState> compact_scatter_kernel_fp16_cpso;
+    id<MTLComputePipelineState> compact_copy_back_kernel_fp16_cpso;
 };
 
 // Explicit metallib path (set by Swift/Python wrappers before first use)
@@ -271,6 +275,8 @@ MetalContext* init_msplat_metal_context() {
     ctx->densify_cull_classify_kernel_cpso        = load(@"densify_cull_classify_kernel");
     ctx->compact_scatter_kernel_cpso              = load(@"compact_scatter_kernel");
     ctx->compact_copy_back_kernel_cpso            = load(@"compact_copy_back_kernel");
+    ctx->compact_scatter_kernel_fp16_cpso         = load(@"compact_scatter_kernel_fp16");
+    ctx->compact_copy_back_kernel_fp16_cpso       = load(@"compact_copy_back_kernel_fp16");
 
     [metal_library release];
 
@@ -351,10 +357,10 @@ void msplat_drain_stage_times(std::vector<double> stage_times[], int max_stages,
 #define RAST_BLOCK_Y 8
 
 // PocketGS replay cache size — must match POCKETGS_K_MAX in msplat_metal.metal.
-// Reverted to 32 after the 480×360 / K=16 attempt also jetsam'd: the cache
-// savings (-55 MB) didn't offset the resolution-driven Adam + render buffer
-// growth on iPhone Pro 6 GB. Back to 320×240 + K=32 + SH=3 which previously
-// completed iter=5000 with 162 k gaussians (~49 MB cache).
+// Final pick: 32 @ 320×240 fp32 (v5/v6 baseline). 480×360 + fp16 Adam was
+// tried in v6 and completed but produced larger gaussians (15 mm vs 4 mm)
+// with worse net detail — densif starved by weaker K=16 backward cache and
+// fp16 noise. iPhone Pro 6 GB ceiling.
 static constexpr uint32_t POCKETGS_K_MAX = 32;
 
 // Step 2b: dispatch toggle. 0 = legacy per-tile-replay backward.
@@ -1918,35 +1924,61 @@ int msplat_densify(
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
         // ---- Stage 8: Compact scatter (18 buffers → scratch) ----
-        // For each buffer: scatter kept elements into compact_scratch
-        // Then copy back. We reuse compact_scratch at different offsets per stride.
+        // For each buffer: scatter kept elements into compact_scratch,
+        // then copy back. Scratch is sized for `chunk_stride` floats per
+        // element (= max(4, ceil(fr_stride/3))) instead of the full
+        // featuresRest stride; large-stride buffers (= the 3 featuresRest
+        // ones at indices 4, 10, 16) are processed in ceil(stride/chunk)
+        // passes. Small-stride buffers (means/scales/quats/dc/opacities)
+        // and their Adam states do 1 pass.
+        //
+        // The scratch is sized in model.cpp's allocBufferPool /
+        // ensureCapacity to match `CHUNK_FLOATS_FOR_FR_STRIDE` below.
+        const uint32_t chunk_stride = (uint32_t)std::max(4, (fr_stride + 2) / 3);
         for (int b = 0; b < 18; b++) {
             uint32_t wc = (uint32_t)worst_case;
-            uint32_t stride_u32 = (uint32_t)all_strides[b];
-            uint32_t total_threads = wc * stride_u32;
-            NSUInteger tpg = MIN(ctx->compact_scatter_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)total_threads);
-            [enc setComputePipelineState:ctx->compact_scatter_kernel_cpso];
-            [enc setBuffer:all_bufs[b]->buffer() offset:0 atIndex:0];
-            ENC_BUF(enc, compact_scratch, 1);
-            ENC_BUF(enc, keep_prefix, 2);
-            ENC_BUF(enc, keep_flag, 3);
-            ENC_SCALAR(enc, wc, 4);
-            ENC_SCALAR(enc, stride_u32, 5);
-            [enc dispatchThreads:MTLSizeMake(total_threads, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+            uint32_t src_stride_u32 = (uint32_t)all_strides[b];
+            uint32_t passes = (src_stride_u32 + chunk_stride - 1) / chunk_stride;
+            // v6: featuresRest Adam was routed through fp16 compact kernels;
+            // rolled back to fp32 in v7 since the fp16 path's memory savings
+            // came at the cost of poor density. The fp16 kernels remain in
+            // the metallib but unused. Always use the fp32 path.
+            id<MTLComputePipelineState> scatter_cpso = ctx->compact_scatter_kernel_cpso;
+            id<MTLComputePipelineState> copy_back_cpso = ctx->compact_copy_back_kernel_cpso;
+            for (uint32_t p = 0; p < passes; p++) {
+                uint32_t sub_start = p * chunk_stride;
+                uint32_t this_chunk = std::min(chunk_stride, src_stride_u32 - sub_start);
+                uint32_t total_threads = wc * this_chunk;
+                NSUInteger tpg = MIN(scatter_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)total_threads);
 
-            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                // Scatter
+                [enc setComputePipelineState:scatter_cpso];
+                [enc setBuffer:all_bufs[b]->buffer() offset:0 atIndex:0];
+                ENC_BUF(enc, compact_scratch, 1);
+                ENC_BUF(enc, keep_prefix, 2);
+                ENC_BUF(enc, keep_flag, 3);
+                ENC_SCALAR(enc, wc, 4);
+                ENC_SCALAR(enc, src_stride_u32, 5);
+                ENC_SCALAR(enc, this_chunk, 6);
+                ENC_SCALAR(enc, sub_start, 7);
+                [enc dispatchThreads:MTLSizeMake(total_threads, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
 
-            // Copy back from scratch to buffer
-            uint32_t last_idx = wc - 1;
-            [enc setComputePipelineState:ctx->compact_copy_back_kernel_cpso];
-            ENC_BUF(enc, compact_scratch, 0);
-            [enc setBuffer:all_bufs[b]->buffer() offset:0 atIndex:1];
-            ENC_BUF(enc, keep_prefix, 2);
-            ENC_SCALAR(enc, last_idx, 3);
-            ENC_SCALAR(enc, stride_u32, 4);
-            [enc dispatchThreads:MTLSizeMake(total_threads, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                // Copy back from scratch to buffer
+                uint32_t last_idx = wc - 1;
+                [enc setComputePipelineState:copy_back_cpso];
+                ENC_BUF(enc, compact_scratch, 0);
+                [enc setBuffer:all_bufs[b]->buffer() offset:0 atIndex:1];
+                ENC_BUF(enc, keep_prefix, 2);
+                ENC_SCALAR(enc, last_idx, 3);
+                ENC_SCALAR(enc, this_chunk, 4);       // scratch (src) stride
+                ENC_SCALAR(enc, src_stride_u32, 5);   // full buffer (dst) stride
+                ENC_SCALAR(enc, sub_start, 6);
+                [enc dispatchThreads:MTLSizeMake(total_threads, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            }
         }
 
         [enc endEncoding];
