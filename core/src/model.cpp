@@ -275,6 +275,18 @@ void Model::releaseOptimizers(){
     densify_split_prefix.reset(); densify_dup_prefix.reset();
     densify_keep_flag.reset(); densify_keep_prefix.reset();
     densify_block_totals.reset(); densify_compact_scratch.reset(); densify_random_samples.reset();
+    // SplatLab patch (step 3/3): release Model-internal MTensors that
+    // were never reset. Note: `backgroundColor` is intentionally NOT reset
+    // here — its MTLBuffer is bound to `nd_rasterize_forward_kernel` at
+    // index 10 ("background[0]") via a path that doesn't re-initialise
+    // on the next train cycle, so resetting causes Metal validation:
+    //   missing Buffer binding at index 10 for background[0]
+    // The other 5 are Model-private and re-allocated each iteration.
+    radii.reset();
+    xysGradNorm.reset();
+    visCounts.reset();
+    max2DSize.reset();
+    window2d.reset();
 }
 
 void Model::schedulersStep(int step){
@@ -306,6 +318,13 @@ void Model::ensureCapacity(int needed){
         MTensor new_buf = gpu_zeros(shape, dt);
         size_t copy_bytes = num_active * buf.stride0() * dtypeSize(dt);
         memcpy(new_buf.data_ptr(), buf.data_ptr(), copy_bytes);
+        // SplatLab patch: drop the old MTLBuffer + mark it purgeable before
+        // overwriting `buf` with the larger one. Without this the prior
+        // pointer is leaked (~500 MB GPU memory per densification cycle on
+        // 50k-gaussian scenes). All consumer views (`means`, `scales`, …)
+        // are refreshed at the bottom of `ensureCapacity` so dangling
+        // pointers don't survive this scope.
+        buf.reset();
         buf = new_buf;
     };
     grow(means_buf); grow(scales_buf); grow(quats_buf);
@@ -314,19 +333,25 @@ void Model::ensureCapacity(int needed){
         grow(adam_exp_avg_buf[g]);
         grow(adam_exp_avg_sq_buf[g]);
     }
-    densify_split_flag = gpu_zeros({new_cap}, DType::Int32);
-    densify_dup_flag = gpu_zeros({new_cap}, DType::Int32);
-    densify_split_prefix = gpu_zeros({new_cap}, DType::Int32);
-    densify_dup_prefix = gpu_zeros({new_cap}, DType::Int32);
-    densify_keep_flag = gpu_zeros({new_cap}, DType::Int32);
-    densify_keep_prefix = gpu_zeros({new_cap}, DType::Int32);
+    // SplatLab patch: explicitly release the old densify scratch buffers
+    // before re-binding to a larger allocation, otherwise the previous
+    // MTLBuffer is overwritten without CFRelease (silent leak ~30 MB per
+    // densification step on 50k gaussians).
+    densify_split_flag.reset();   densify_split_flag = gpu_zeros({new_cap}, DType::Int32);
+    densify_dup_flag.reset();     densify_dup_flag = gpu_zeros({new_cap}, DType::Int32);
+    densify_split_prefix.reset(); densify_split_prefix = gpu_zeros({new_cap}, DType::Int32);
+    densify_dup_prefix.reset();   densify_dup_prefix = gpu_zeros({new_cap}, DType::Int32);
+    densify_keep_flag.reset();    densify_keep_flag = gpu_zeros({new_cap}, DType::Int32);
+    densify_keep_prefix.reset();  densify_keep_prefix = gpu_zeros({new_cap}, DType::Int32);
     int max_blocks = (new_cap + 1023) / 1024;
-    densify_block_totals = gpu_zeros({max_blocks}, DType::Int32);
+    densify_block_totals.reset(); densify_block_totals = gpu_zeros({max_blocks}, DType::Int32);
     int64_t fr_stride = featuresRest_buf.stride0();
     // Chunked scratch — see comment in allocBufferPool. chunk_stride matches
     // the dispatch loop in msplat_metal.mm's compact stage.
     int64_t chunk_stride = std::max((int64_t)4, (fr_stride + 2) / 3);
+    densify_compact_scratch.reset();
     densify_compact_scratch = gpu_zeros({(int64_t)new_cap * chunk_stride}, DType::Float32);
+    densify_random_samples.reset();
     densify_random_samples = gpu_zeros({new_cap, 3}, DType::Float32);
 
     buf_capacity = new_cap;

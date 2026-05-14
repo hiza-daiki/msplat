@@ -293,12 +293,92 @@ MetalContext* init_msplat_metal_context() {
     return ctx;
 }
 
+// SplatLab patch: moved from a function-local static to a file-scope static
+// so `destroy_msplat_metal_context()` can null it out and force lazy
+// re-initialisation on the next get_global_context() call.
+static MetalContext* g_metal_ctx = NULL;
+
 MetalContext* get_global_context() {
-    static MetalContext* ctx = NULL;
-    if (ctx == NULL) {
-        ctx = init_msplat_metal_context();
+    if (g_metal_ctx == NULL) {
+        g_metal_ctx = init_msplat_metal_context();
     }
-    return ctx;
+    return g_metal_ctx;
+}
+
+// SplatLab patch: tear down msplat's process-lifetime MetalContext so the
+// pipeline states / metallib-derived functions / command queue / sample
+// buffer / dispatch queue are all released. Combined with cleanup_msplat_metal
+// (g_tcache reset), this releases the entire msplat working set and any
+// driver-side resource pool tied to MTLDevice. Called from the
+// `UIApplicationDidEnterBackgroundNotification` hook on the SplatLab side
+// when no training is active.
+void destroy_msplat_metal_context() {
+    fprintf(stderr, "[msplat] destroy_msplat_metal_context called (g_metal_ctx=%p)\n",
+            (void*)g_metal_ctx);
+    if (g_metal_ctx == NULL) return;
+
+    // Finish any in-flight work first so we don't release a still-running CB.
+    if (g_metal_ctx->_currentCB) {
+        [g_metal_ctx->_currentCB commit];
+        [g_metal_ctx->_currentCB waitUntilCompleted];
+        [g_metal_ctx->_currentCB release];
+        g_metal_ctx->_currentCB = nil;
+    }
+
+    // Release all 28 compute pipeline states.
+    auto rel = [](id<MTLComputePipelineState>& p) {
+        if (p) { [p release]; p = nil; }
+    };
+    rel(g_metal_ctx->project_and_sh_forward_kernel_cpso);
+    rel(g_metal_ctx->nd_rasterize_forward_kernel_cpso);
+    rel(g_metal_ctx->pgs_rasterize_backward_kernel_cpso);
+    rel(g_metal_ctx->pgs_rasterize_backward_tg_kernel_cpso);
+    rel(g_metal_ctx->scatter_to_prealloc_bins_kernel_cpso);
+    rel(g_metal_ctx->bitonic_sort_per_tile_kernel_cpso);
+    rel(g_metal_ctx->prefix_sum_kernel_cpso);
+    rel(g_metal_ctx->block_reduce_kernel_cpso);
+    rel(g_metal_ctx->block_scan_propagate_kernel_cpso);
+    rel(g_metal_ctx->rasterize_forward_chunked_kernel_cpso);
+    rel(g_metal_ctx->rasterize_forward_merge_kernel_cpso);
+    rel(g_metal_ctx->compute_chunk_prefix_suffix_kernel_cpso);
+    rel(g_metal_ctx->rasterize_backward_chunked_kernel_cpso);
+    rel(g_metal_ctx->rasterize_backward_kernel_cpso);
+    rel(g_metal_ctx->ssim_h_fwd_kernel_cpso);
+    rel(g_metal_ctx->ssim_v_fwd_kernel_cpso);
+    rel(g_metal_ctx->ssim_fused_v_fwd_h_bwd_kernel_cpso);
+    rel(g_metal_ctx->ssim_v_bwd_kernel_cpso);
+    rel(g_metal_ctx->project_and_sh_backward_kernel_cpso);
+    rel(g_metal_ctx->fused_adam_kernel_cpso);
+    rel(g_metal_ctx->accumulate_grad_stats_kernel_cpso);
+    rel(g_metal_ctx->densify_classify_kernel_cpso);
+    rel(g_metal_ctx->densify_append_split_kernel_cpso);
+    rel(g_metal_ctx->densify_append_dup_kernel_cpso);
+    rel(g_metal_ctx->densify_cull_classify_kernel_cpso);
+    rel(g_metal_ctx->compact_scatter_kernel_cpso);
+    rel(g_metal_ctx->compact_copy_back_kernel_cpso);
+    rel(g_metal_ctx->compact_scatter_kernel_fp16_cpso);
+    rel(g_metal_ctx->compact_copy_back_kernel_fp16_cpso);
+
+    if (g_metal_ctx->counterSampleBuffer) {
+        [g_metal_ctx->counterSampleBuffer release];
+        g_metal_ctx->counterSampleBuffer = nil;
+    }
+    if (g_metal_ctx->queue) {
+        [g_metal_ctx->queue release];
+        g_metal_ctx->queue = nil;
+    }
+    if (g_metal_ctx->device) {
+        [g_metal_ctx->device release];
+        g_metal_ctx->device = nil;
+    }
+    if (g_metal_ctx->d_queue) {
+        dispatch_release(g_metal_ctx->d_queue);
+        g_metal_ctx->d_queue = NULL;
+    }
+
+    free(g_metal_ctx);
+    g_metal_ctx = NULL;
+    fprintf(stderr, "[msplat] destroy_msplat_metal_context finished\n");
 }
 
 
@@ -547,6 +627,62 @@ struct FusedTensorCache {
 static FusedTensorCache g_tcache;
 
 void cleanup_msplat_metal() {
+    // SplatLab patch: explicitly reset every MTensor in g_tcache so its
+    // backing MTLBuffer is marked purgeable and released. The default
+    // copy-assign path used by `g_tcache = FusedTensorCache{}` overwrites
+    // _buffer without releasing it, which combined with the Metal
+    // non-volatile resource pool was leaking ~500 MB GPU memory per
+    // train cycle.
+    auto purge = [](MTensor& t) { if (t.defined()) t.reset(); };
+    purge(g_tcache.xys);
+    purge(g_tcache.depths);
+    purge(g_tcache.radii_out);
+    purge(g_tcache.conics);
+    purge(g_tcache.num_tiles_hit);
+    purge(g_tcache.colors);
+    purge(g_tcache.aabb);
+    purge(g_tcache.gaussian_ids);
+    purge(g_tcache.packed_xy_opac);
+    purge(g_tcache.packed_conic);
+    purge(g_tcache.packed_rgb);
+    purge(g_tcache.out_img);
+    purge(g_tcache.final_Ts);
+    purge(g_tcache.final_idx);
+    purge(g_tcache.loss_intermediates);
+    purge(g_tcache.ssim_h_buf);
+    purge(g_tcache.tile_bins);
+    purge(g_tcache.loss_sum);
+    purge(g_tcache.tile_offsets);
+    purge(g_tcache.tile_scatter_counters);
+    purge(g_tcache.prealloc_bins);
+    purge(g_tcache.block_totals);
+    purge(g_tcache.overflow_flag);
+    purge(g_tcache.chunk_T);
+    purge(g_tcache.chunk_C);
+    purge(g_tcache.chunk_final_idx);
+    purge(g_tcache.prefix_T);
+    purge(g_tcache.after_C);
+    purge(g_tcache.v_rendered);
+    purge(g_tcache.v_xy);
+    purge(g_tcache.v_conic);
+    purge(g_tcache.v_colors_rast);
+    purge(g_tcache.v_opacity);
+    purge(g_tcache.v_depth);
+    purge(g_tcache.v_mean3d);
+    purge(g_tcache.v_scale);
+    purge(g_tcache.v_quat);
+    purge(g_tcache.v_features_dc);
+    purge(g_tcache.v_features_rest);
+    purge(g_tcache.pgs_cache_ids);
+    purge(g_tcache.pgs_cache_Cin);
+    purge(g_tcache.pgs_cache_alpha);
+    purge(g_tcache.pgs_cache_count);
+    purge(g_tcache.pgs_overflow_count);
+    purge(g_tcache.pgs_chunk_cache_count);
+    purge(g_tcache.pgs_shadow_v_xy);
+    purge(g_tcache.pgs_shadow_v_conic);
+    purge(g_tcache.pgs_shadow_v_colors_rast);
+    purge(g_tcache.pgs_shadow_v_opacity);
     g_tcache = FusedTensorCache{};
 }
 

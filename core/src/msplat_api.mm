@@ -42,7 +42,26 @@ Dataset::Dataset(const std::string& path, float downscaleFactor,
     }
 }
 
-Dataset::~Dataset() = default;
+Dataset::~Dataset() {
+    if (!impl) return;
+    // SplatLab patch (step 2/3): release MTLBuffers held in each Camera.
+    // trainCams/testCams are vector-copied from data.cameras with raw
+    // pointer sharing (MTensor has no copy ctor), so reset on one side
+    // only; clear data.cameras without touching its MTensors.
+    auto resetCams = [](std::vector<Camera>& cams) {
+        for (auto& cam : cams) {
+            cam.cachedViewMat.reset();
+            cam.cachedProjViewMat.reset();
+            for (auto& kv : cam.mtensorImageCache) {
+                kv.second.reset();
+            }
+            cam.mtensorImageCache.clear();
+        }
+    };
+    resetCams(impl->trainCams);
+    resetCams(impl->testCams);
+    impl->data.cameras.clear();
+}
 Dataset::Dataset(Dataset&&) noexcept = default;
 Dataset& Dataset::operator=(Dataset&&) noexcept = default;
 
@@ -192,9 +211,11 @@ PixelBuffer Trainer::renderFromPose(const float camToWorld[16], int refCameraInd
 
     Camera cam = cams[refCameraIndex];  // copy intrinsics
     memcpy(cam.camToWorld, camToWorld, 16 * sizeof(float));
-    // Invalidate cached matrices so prepareCam recomputes from the new pose
-    cam.cachedViewMat = MTensor();
-    cam.cachedProjViewMat = MTensor();
+    // Invalidate cached matrices so prepareCam recomputes from the new pose.
+    // SplatLab patch (step 1/3): release the previously retained MTLBuffer
+    // before clearing, otherwise the `= MTensor()` raw-overwrite leaked it.
+    cam.cachedViewMat.reset();
+    cam.cachedProjViewMat.reset();
 
     MTensor rgb = impl->model->render(cam, impl->currentStep);
     msplat_gpu_sync();
@@ -216,8 +237,9 @@ void Trainer::renderFromPoseToBuffer(const float camToWorld[16], int refCameraIn
 
     Camera cam = cams[refCameraIndex];
     memcpy(cam.camToWorld, camToWorld, 16 * sizeof(float));
-    cam.cachedViewMat = MTensor();
-    cam.cachedProjViewMat = MTensor();
+    // SplatLab patch (step 1/3): see renderFromPose above.
+    cam.cachedViewMat.reset();
+    cam.cachedProjViewMat.reset();
 
     MTensor rgb = impl->model->render(cam, impl->currentStep);
     msplat_gpu_sync();
@@ -383,6 +405,10 @@ int msplat_trainer_load_checkpoint(MsplatTrainer t, const char* path) {
 
 int msplat_trainer_splat_count(MsplatTrainer t) {
     return static_cast<msplat::Trainer*>(t)->splatCount();
+}
+
+void msplat_destroy_context(void) {
+    destroy_msplat_metal_context();
 }
 
 int msplat_trainer_iteration(MsplatTrainer t) {

@@ -35,6 +35,10 @@ inline size_t dtypeSize(DType dt) {
 }
 
 // Lightweight GPU tensor — wraps an MTLBuffer with shape metadata.
+// Ownership semantics intentionally left at the default (raw pointer copy on
+// copy/assign, no destructor) because msplat's call sites pass MTensors by
+// value all over the place and rely on the shared raw pointer to stay alive.
+// Memory is released explicitly via `reset()` / `cleanup_msplat_metal()`.
 class MTensor {
 public:
     MTensor() = default;
@@ -103,7 +107,16 @@ public:
 
     void reset() {
 #ifdef __OBJC__
-        if (_buffer) { CFRelease(_buffer); }
+        if (_buffer) {
+            // SplatLab patch: tell the Metal driver we don't need this
+            // buffer's physical pages anymore. Without this the driver keeps
+            // the MTLBuffer in its non-volatile resource pool even after
+            // CFRelease, causing IOAccelerator graphics +500 MB per train
+            // run.
+            id<MTLBuffer> buf = (__bridge id<MTLBuffer>)_buffer;
+            [buf setPurgeableState:MTLPurgeableStateEmpty];
+            CFRelease(_buffer);
+        }
 #endif
         _buffer = nullptr;
         _data = nullptr;

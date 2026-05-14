@@ -120,6 +120,13 @@ void msplat_set_metallib_path(const char* path);
 void msplat_sync(void);
 void msplat_cleanup(void);
 
+// SplatLab patch: completely tear down msplat's global MetalContext
+// (pipeline states + queues + library-derived functions). Calls
+// msplat_cleanup() first. Subsequent msplat_* calls lazily re-init.
+// Intended for background hooks where the app wants to free all msplat
+// GPU memory.
+void msplat_destroy_context(void);
+
 #ifdef __cplusplus
 }
 #endif

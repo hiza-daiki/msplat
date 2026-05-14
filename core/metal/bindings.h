@@ -7,6 +7,12 @@
 // Release all cached GPU tensors (call before exit to prevent GPU memory leak)
 void cleanup_msplat_metal();
 
+// SplatLab patch: full tear-down of the global MetalContext (pipeline states,
+// command queue, dispatch queue, sample buffer). Calls cleanup_msplat_metal
+// first. After this call the next msplat_* API will lazily re-initialise the
+// context.
+void destroy_msplat_metal_context();
+
 // Returns the Metal device used by the msplat context (void* in C++, id<MTLDevice> in ObjC++)
 #ifdef __OBJC__
 id<MTLDevice> msplat_device();
